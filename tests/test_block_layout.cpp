@@ -110,7 +110,9 @@ TEST(BlockLayout, PayloadAddressIsAlignedAcrossMultipleAlignedBases) {
     // alignment isn't accidentally satisfied by one lucky address.
     for (int i = 0; i < 8; ++i) {
         alignas(alignof(std::max_align_t)) std::array<std::byte, sizeof(BlockHeader) + 64> storage{};
-        auto* header = new (storage.data()) BlockHeader(64, /*free=*/true);
+        // free=false: payload() now asserts !is_free() (see block.hpp), and
+        // this test specifically exercises payload(), not free_list_links().
+        auto* header = new (storage.data()) BlockHeader(64, /*free=*/false);
 
         const auto payload_addr = reinterpret_cast<std::uintptr_t>(header->payload());
         EXPECT_EQ(payload_addr % alignof(std::max_align_t), 0u)

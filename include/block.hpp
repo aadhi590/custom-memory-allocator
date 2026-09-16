@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 
@@ -128,29 +129,47 @@ public:
     // --- payload / free-list access -------------------------------------
 
     // Address of the user payload, valid only while the block is allocated.
-    // header address + sizeof(BlockHeader) is guaranteed aligned to
-    // alignof(std::max_align_t) by the static_asserts below, so this needs
-    // no extra rounding.
+    // Guarded by an assert (compiled out under NDEBUG) rather than left as
+    // documentation alone -- see the "payload()/free_list_links() runtime
+    // invariant guards" entry in docs/design-decisions.md.
     [[nodiscard]] void* payload() noexcept {
-        return reinterpret_cast<std::byte*>(this) + sizeof(BlockHeader);
+        assert(!is_free() && "payload() called on a free block");
+        return data_address();
     }
 
     [[nodiscard]] const void* payload() const noexcept {
-        return reinterpret_cast<const std::byte*>(this) + sizeof(BlockHeader);
+        assert(!is_free() && "payload() called on a free block");
+        return data_address();
     }
 
     // View of the trailing bytes as free-list links, valid only while the
     // block is free. Overlays the same storage that payload() points to.
     [[nodiscard]] FreeListLinks* free_list_links() noexcept {
-        return reinterpret_cast<FreeListLinks*>(payload());
+        assert(is_free() && "free_list_links() called on an allocated block");
+        return reinterpret_cast<FreeListLinks*>(data_address());
     }
 
     [[nodiscard]] const FreeListLinks* free_list_links() const noexcept {
-        return reinterpret_cast<const FreeListLinks*>(payload());
+        assert(is_free() && "free_list_links() called on an allocated block");
+        return reinterpret_cast<const FreeListLinks*>(data_address());
     }
 
 private:
     static constexpr std::size_t kFreeFlagMask = 0x1;
+
+    // Address of the bytes immediately following this header -- the shared
+    // computation behind both payload() and free_list_links(). Deliberately
+    // has no is_free() assertion of its own: payload() and
+    // free_list_links() require *opposite* states, so the assertion has to
+    // live in each public accessor rather than here, where it would
+    // wrongly reject one of the two valid callers every time.
+    [[nodiscard]] void* data_address() noexcept {
+        return reinterpret_cast<std::byte*>(this) + sizeof(BlockHeader);
+    }
+
+    [[nodiscard]] const void* data_address() const noexcept {
+        return reinterpret_cast<const std::byte*>(this) + sizeof(BlockHeader);
+    }
 
     // Size (with the is_free flag packed into bit 0). This is the only data
     // member: next/prev free-list pointers and the user payload both live in
