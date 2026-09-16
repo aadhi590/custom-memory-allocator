@@ -102,30 +102,36 @@ member.
 
 ## Known issues / deferred hardening
 
-Items identified during the Phase 1 → Phase 2 review of `block.hpp` that are
-deliberately *not* being fixed now, tracked here so they aren't forgotten.
-None of these block Phase 2 (the bump allocator never frees, so several of
-them aren't reachable yet), but they should be revisited as the phases that
-depend on them land.
+Items identified during the Phase 1 → Phase 2 review of `block.hpp`. Items 1
+and 2 were resolved in Phase 3, once free-list code existed to make the
+questions concrete; items 3 and 4 remain deliberately deferred.
 
-1. **`FreeListLinks` uses raw `void* next/prev` instead of `BlockHeader*`.**
-   Storing the links as `BlockHeader*` would let free-list code walk the list
-   without a `reinterpret_cast` at every step. It's `void*` for now because
-   it's not yet clear whether `BlockHeader*` is safe to name inside
-   `FreeListLinks` given declaration order (`FreeListLinks` is defined above
-   `BlockHeader` in `block.hpp`), or whether `void*` was actually the
-   intentional choice to sidestep an incomplete-type issue. Revisit when
-   Phase 3's free-list code is written and this stops being hypothetical.
+1. **RESOLVED (Phase 3): `FreeListLinks` now uses `BlockHeader*` instead of
+   `void*`.** The open question was whether `BlockHeader*` could even be
+   named inside `FreeListLinks`, which is defined above `BlockHeader` in
+   `block.hpp`. It can: a forward declaration (`class BlockHeader;`) placed
+   before `FreeListLinks` is sufficient, because a pointer's size and
+   representation don't depend on the pointee type being complete -- only
+   *dereferencing* the pointer requires completeness, and nothing does that
+   until `free_list.cpp` (which includes the full `block.hpp` and therefore
+   sees the complete `BlockHeader` class). `void*` was not an intentional
+   design choice; it was simply what Phase 1 wrote before there was any
+   free-list code to prove out the alternative. Switching to `BlockHeader*`
+   removes a `reinterpret_cast` from every free-list traversal step and lets
+   that code call `is_free()`/`get_size()`/etc. directly on list nodes.
 
-2. **`payload()` and `free_list_links()` have no runtime invariant
-   enforcement.** The rule "`payload()` is only valid on an allocated block;
-   `free_list_links()` is only valid on a free block" is currently just a
-   documented convention in the header comment — there's no
-   `assert(is_free())` / `assert(!is_free())` guarding either accessor. A
-   caller that gets the free/allocated bookkeeping wrong today
-   compiles and runs, silently reading garbage. Worth adding asserts once
-   there's real code on both sides of the free/allocated boundary to exercise
-   them (Phase 3).
+2. **RESOLVED (Phase 3): `payload()` and `free_list_links()` now assert
+   their invariants.** `payload()` asserts `!is_free()`;
+   `free_list_links()` asserts `is_free()`. Both compile out in release
+   builds (`NDEBUG`), matching how the rest of the codebase treats
+   `<cassert>` assertions -- these are debug-time bug detectors, not
+   input validation. Implementing this required splitting out a private,
+   assertion-free `data_address()` helper that both accessors call
+   internally: `free_list_links()` needs to compute the same address
+   `payload()` does, and it needs to do so on a block that is free (i.e.
+   exactly the block state where `payload()`'s assertion would fire), so
+   the two accessors can no longer share the address computation directly
+   without tripping each other's guard.
 
 3. **`set_size()` silently masks off an already-set flag bit instead of
    asserting the precondition.** The comment above `set_size()` states the
