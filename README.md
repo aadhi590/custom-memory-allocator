@@ -65,6 +65,14 @@ scripts/     developer tooling (Phase 9+)
 
 ## Roadmap
 
+**The project plan was trimmed from an original 13 phases to 7, partway
+through, for time.** Phases 0-5 below are unchanged from the original plan.
+Phase 6 is this project's current phase. Phase 7 is a merged final phase
+covering what the original plan spread across separate concurrency,
+benchmarking, hardening, and polish phases. See the "Scope reduction:
+13 phases to 7" entry in [docs/design-decisions.md](docs/design-decisions.md)
+for the full rationale and exactly what was cut.
+
 - [x] **Phase 0** — Project scaffolding: repo layout, CMake + GoogleTest
       build, licensing, tooling config.
 - [x] **Phase 1** — Block metadata: `BlockHeader` layout, bit-packed
@@ -78,24 +86,27 @@ scripts/     developer tooling (Phase 9+)
 - [x] **Phase 5** — `my_calloc`/`my_realloc`: overflow-checked, always-zeroed
       calloc; realloc with in-place growth/shrink via Phase 4's
       splitting/coalescing where possible, allocate+copy+free otherwise.
-      (Originally scoped as "Phase 5 — Alignment" / "Phase 7 — Realloc" in
-      this roadmap's first draft; realloc's scope moved up and merged with
-      calloc as the actual work was scoped session-to-session. Alignment
-      support is still outstanding and not yet assigned a phase number.)
-- [ ] **Phase 6** — Memory pools: multiple mmap-backed arenas, pool growth
-      and management.
-- *(Phase 7 was realloc, folded into Phase 5 above — numbering intentionally
-  skips from 6 to 8 to avoid renumbering phases already referenced
-  elsewhere.)*
-- [ ] **Phase 8** — Thread safety: locking strategy, then a per-thread cache
-      to reduce contention.
-- [ ] **Phase 9** — Instrumentation: allocation statistics, benchmarking
-      harness, stress tests.
-- [ ] **Phase 10** — Hardening: corruption detection, fuzzing, sanitizer
-      coverage.
-- [ ] **Phase 11** — CI: GitHub Actions workflows (build, test, sanitizers).
-- [ ] **Phase 12** — Examples and API polish: example programs, documentation
-      pass.
+- [ ] **Phase 6** — Memory pools / size classes: fixed-size slot pools for
+      small, common allocation sizes as a second, O(1) allocation path
+      alongside the general free-list allocator (which continues to handle
+      everything above the largest size class).
+- [ ] **Phase 7** — Concurrency and performance benchmarking (merged final
+      phase): a locking progression for thread safety, thread-local caching
+      to reduce contention, and benchmarking the allocator's performance.
+
+### Cut from the original 13-phase plan
+
+These were explicitly part of the original plan and are now out of scope
+for this project rather than silently dropped:
+- Caller-requested alignment beyond the default (originally slated as its
+  own phase before the plan was trimmed).
+- A formal CI / GitHub Actions workflow.
+- A separate stress-testing phase (folded into ordinary test-suite work
+  throughout, rather than a dedicated phase).
+- A separate performance-optimization-pass phase distinct from Phase 7's
+  benchmarking.
+- The full 9-workload/formal-fragmentation-metrics benchmark suite
+  originally envisioned — Phase 7's benchmarking is scoped down from this.
 
 ## License
 

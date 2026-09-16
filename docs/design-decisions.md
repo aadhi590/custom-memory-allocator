@@ -150,6 +150,62 @@ system-diagram level for a reader working top-down through the layers.
 
 ---
 
+## 4. Scope reduction: 13 phases to 7
+
+**Decision**: partway through the project (immediately before Phase 6), the
+original 13-phase plan was deliberately trimmed to 7 total phases, for time.
+This is a scope decision, not an abandonment — everything below was
+explicitly considered and cut, not silently dropped or forgotten.
+
+**What changed**: Phases 0-5 are unchanged from the original plan (project
+scaffolding through `calloc`/`realloc`). Phase 6 (memory pools / size
+classes) is unchanged in substance from the original plan's memory-pools
+phase. Everything the original plan spread across the remaining phases —
+concurrency/locking, thread-local caching, performance benchmarking,
+hardening, a CI phase, and a final polish phase — is merged into a single
+Phase 7: "Concurrency and performance benchmarking."
+
+**What was cut, specifically, rather than silently dropped**:
+- **Caller-requested alignment beyond the default.** Originally its own
+  phase. The general-path allocator already guarantees
+  `alignof(std::max_align_t)` alignment for every allocation (see
+  `docs/memory-model.md`); supporting caller-requested *stricter*
+  alignments (e.g. for SIMD types) is a real, well-scoped feature, but not
+  one that fits the remaining time budget.
+- **A formal CI / GitHub Actions workflow.** Every phase in this project
+  has been built and verified locally (including under
+  `-fsanitize=address,undefined`) before being pushed, which covers the
+  correctness goal a CI pipeline would otherwise exist to enforce; automating
+  that enforcement on every push is being cut as a distinct phase.
+- **A separate stress-testing phase.** Stress-style tests (e.g. the
+  ~600-allocation arena-rollover test from Phase 2, the mixed-routing test
+  from Phase 6) are written inline as part of each phase's normal test
+  suite instead of being reserved for a dedicated later phase.
+- **A separate performance-optimization-pass phase**, distinct from
+  measuring performance at all. Phase 7 benchmarks the allocator as it
+  stands; a follow-up phase specifically dedicated to acting on those
+  numbers (profiling and tuning hot paths) is cut.
+- **The full 9-workload/formal-fragmentation-metrics benchmark suite**
+  originally envisioned for the benchmarking phase. Phase 7's benchmarking
+  is scoped down to comparing the allocator's own before/after numbers
+  (e.g. pooled vs. general-path allocation latency, lock-contention
+  behavior) rather than a large, formally-designed workload suite with
+  fragmentation-metric tracking.
+
+**Reasoning**: this project's goal (per the README's Motivation section) is
+demonstrating real allocator engineering tradeoffs for a systems/embedded
+C++ portfolio, not shipping a production-grade allocator. The core
+learning content — block layout, free lists, splitting/coalescing,
+calloc/realloc, size-class pools, and a concurrency story with
+benchmarking to back it up — is fully covered by the 7-phase plan. The cut
+items are real, valuable engineering work, but they extend the project's
+breadth (more features, more infrastructure) rather than its depth on the
+allocator internals the project is actually about, and cutting them now
+means the phases that remain get done well rather than the full list being
+rushed.
+
+---
+
 ## Known issues / deferred hardening
 
 Items identified during the Phase 1 → Phase 2 review of `block.hpp`. Items 1
