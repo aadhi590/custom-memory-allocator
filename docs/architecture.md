@@ -50,8 +50,8 @@ means:
 ┌───────────────────────────────▼───────────────────────────────────┐
 │  Free Lists / Memory Pools                                          │
 │  include/free_list.hpp, include/memory_pool.hpp                     │
-│  - free_list: intrusive linked list(s) of free blocks, searched       │
-│    for a block that satisfies a given size                           │
+│  - free_list: intrusive doubly-linked list of free blocks, searched   │
+│    first-fit (see note below the diagram)                            │
 │  - memory_pool: tracks the OS-backed regions ("arenas") the           │
 │    allocator owns, and hands out fresh space when no free block        │
 │    is big enough                                                      │
@@ -74,6 +74,22 @@ means:
 │  - the only layer that talks to the kernel                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Free list search strategy: first-fit
+
+The general free list (`include/free_list.hpp`) is searched **first-fit**:
+walk the list from the head and take the first block whose size is large
+enough, rather than **best-fit** (scanning the whole list to find the
+smallest block that still fits). First-fit is the standard starting point
+for a general-purpose allocator's free list -- it's simpler to implement
+correctly, and it avoids paying for a full list walk on every single
+allocation. Best-fit's appeal is reduced wasted space per allocation (it
+hands out a more tightly-sized block instead of an oversized one), but that
+benefit is a real measurement question -- how much fragmentation first-fit
+actually costs in practice depends on allocation patterns this project
+doesn't have real data for yet. Revisiting first-fit vs. best-fit (or a
+hybrid, like next-fit) is deferred until there's a benchmarking harness
+(Phase 9) to measure the tradeoff instead of guessing at it.
 
 ## Request flow (target shape, once later phases land)
 
