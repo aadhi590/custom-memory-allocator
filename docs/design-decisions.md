@@ -100,6 +100,56 @@ member.
 
 ---
 
+## 3. Why first-fit instead of best-fit for the free list search
+
+**Decision**: `FreeList::find_first_fit()` (Phase 3) walks the free list
+from the head and returns the first block whose size is large enough,
+rather than scanning the whole list to find the smallest block that still
+fits ("best-fit").
+
+**Alternatives considered**:
+- **First-fit** (chosen): return the first sufficiently-large block
+  encountered during the walk.
+- **Best-fit**: scan every free block and return the smallest one that
+  still satisfies the request.
+- **Next-fit**: a first-fit variant that resumes searching from wherever
+  the previous search left off, instead of always restarting at the head.
+
+**Reasoning**:
+
+- **Simplicity first.** First-fit is the simplest correct search strategy
+  for an unsegregated free list, and it's the natural starting point before
+  later phases add size-class segregation (Phase 6) or other structural
+  changes that make the search strategy question worth revisiting from
+  scratch.
+- **Avoids paying for a full list walk on every allocation.** Best-fit
+  guarantees it will find the smallest sufficient block, but doing so
+  requires visiting every free block on every single call, even when an
+  early block would have worked fine. First-fit can return as soon as it
+  finds any sufficient block.
+- **The real tradeoff needs data, not guesses.** Best-fit's actual
+  advantage — less wasted space per allocation, because it avoids handing
+  out an oversized block when a tighter one exists — is a genuine
+  fragmentation win in some workloads. But whether that win is worth its
+  search cost depends on real allocation patterns this project doesn't have
+  benchmark data for yet. Deciding between first-fit, best-fit, and
+  next-fit from first principles instead of measurement would be guessing;
+  that comparison is deferred until there's a benchmarking harness
+  (Phase 9).
+- **Cost accepted**: first-fit is known to be more prone to leaving small,
+  hard-to-reuse fragments near the head of the list than best-fit is,
+  which is exactly what Phase 4's splitting and coalescing exist to
+  mitigate (splitting avoids handing out an oversized block whole in the
+  first place; coalescing merges adjacent small free fragments back
+  together). The two phases are complementary: first-fit's weakness is
+  addressed by the block-management logic around it, not by the search
+  strategy itself.
+
+See also `docs/architecture.md`, which documents this same decision at the
+system-diagram level for a reader working top-down through the layers.
+
+---
+
 ## Known issues / deferred hardening
 
 Items identified during the Phase 1 → Phase 2 review of `block.hpp`. Items 1
