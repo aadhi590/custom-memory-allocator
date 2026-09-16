@@ -41,6 +41,7 @@ add_executable(allocator_tests
     tests/test_os_memory.cpp
     tests/test_allocator.cpp
     tests/test_free_list.cpp
+    tests/test_splitting.cpp
     tests/test_coalescing.cpp
     src/os_memory.cpp
     src/allocator.cpp
