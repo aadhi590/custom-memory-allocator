@@ -206,6 +206,63 @@ rushed.
 
 ---
 
+## 5. Pointer-to-pool routing: a validated speculative tag, not an arena range check
+
+**Decision**: `my_free()`/`my_realloc()` determine whether a pointer came
+from a pool by speculatively reading a `Pool*` tag from the pointer's
+presumed header location and validating it against the small, fixed set
+of known `Pool` object addresses (`is_known_pool()`), rather than checking
+the pointer's address against each pool's tracked arena ranges.
+
+**Alternatives considered**:
+- **Per-pool arena range check**: for each pool, check whether `ptr` falls
+  within any of that pool's tracked arena address ranges. Cost grows with
+  the total number of arenas across all pools -- O(total pool arenas),
+  worst case checked one pool at a time.
+- **Validated speculative tag** (chosen): every pooled slot's header
+  stores a `Pool*` identifying its owning pool (`PoolSlotHeader`, see
+  `memory_pool.hpp`). `my_free()` reads that field unconditionally and
+  checks whether it equals the address of one of the 9 statically-known
+  `Pool` objects.
+
+**Reasoning**:
+
+- **O(kNumSizeClasses), not O(arenas or allocations).** `kNumSizeClasses`
+  is a compile-time constant (9). Validating a tag against 9 known
+  addresses costs the same whether the allocator has acquired 2 arenas or
+  2000 -- it depends only on how many size classes exist, never on how
+  much memory has been requested from the OS or how many allocations are
+  live. An arena range check's cost, by contrast, grows with exactly those
+  things. Since Phase 7 benchmarks allocation/deallocation latency
+  directly, this asymptotic difference is the whole point of choosing it.
+- **No false positives, by construction, not by luck.** A general-path
+  block's header stores a small `size_t` (at most a few GiB in any
+  realistic allocation). A `Pool` object's address is a static-storage-
+  duration address in the program's data segment. These two value spaces
+  don't overlap in practice -- a real allocation size can never
+  numerically equal one of the 9 known `Pool` addresses -- so reading the
+  tag speculatively and validating it is exact for this allocator's
+  threat model (legitimate callers passing pointers this allocator
+  actually returned), not merely "astronomically unlikely to collide."
+- **Doesn't touch the general path's `BlockHeader` format.** An
+  alternative that embeds a discriminant tag directly in `BlockHeader`
+  (so every block, pooled or general, is self-describing) was considered
+  and rejected: it would mean modifying the already-established,
+  already-tested Phase 1-5 header format purely to serve Phase 6's
+  routing problem, trading a stable, unchanged general path for a
+  speculative-tag design that lives entirely in the new code instead.
+- **Cost accepted**: this technique relies on the "no false positives in
+  practice" reasoning above rather than a type-safe discriminant, which is
+  a weaker guarantee in the abstract (though not in this allocator's
+  actual usage). A defensive `assert` in both `my_free()` and
+  `my_realloc()` (compiled out under `NDEBUG`, like the rest of this
+  codebase's invariant checks) catches the other failure mode -- a
+  pointer that's neither a recognized pool tag nor within a tracked
+  general-path arena -- so a genuinely invalid pointer is caught loudly in
+  debug builds rather than silently misinterpreted either way.
+
+---
+
 ## Known issues / deferred hardening
 
 Items identified during the Phase 1 → Phase 2 review of `block.hpp`. Items 1

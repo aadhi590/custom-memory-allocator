@@ -8,24 +8,24 @@
 // Public allocator API. This is the only header application code is meant
 // to include directly.
 //
-// Phase 5 status: my_malloc() first tries to satisfy a request by reusing a
-// block from the free list (see free_list.hpp). If the found block is
-// larger than needed by at least kMinBlockSize, it's split: shrunk to the
-// requested size, with the leftover carved into a new free block and
-// reinserted into the free list. If the leftover would be too small to
-// stand on its own as a block, the whole free block is handed over
-// instead. If no free block fits at all, my_malloc() falls back to
-// bump-pointer allocation over mmap-backed arenas (see os_memory.hpp),
-// requesting a new arena from the OS when the current one runs out of
-// room. my_free() marks a block free, coalesces it with any free physical
-// neighbors (within the same arena -- see the arena-boundary-safety
-// helpers in allocator.cpp), and inserts the resulting block into the
-// free list, making it available for reuse. my_calloc() layers
-// overflow-checked zero-initialization on top of my_malloc(); my_realloc()
-// reuses the same splitting/coalescing machinery to grow a block in place
-// when possible, falling back to allocate+copy+free otherwise. See
-// src/allocator.cpp and docs/memory-model.md for the full rationale and
-// worked examples.
+// Phase 6 status: my_malloc() first checks size_class_for(size)
+// (memory_pool.hpp). A real size class (<= 4096 bytes) delegates to that
+// class's fixed-size Pool, an O(1) allocation path with zero search, zero
+// splitting, and zero coalescing. Anything too large for any size class
+// falls through to the general path unchanged from Phase 3-5: reusing a
+// block from the free list (see free_list.hpp), splitting it if the
+// leftover is large enough to stand on its own, or falling back to
+// bump-pointer allocation over mmap-backed arenas (see os_memory.hpp).
+// my_free() and my_realloc() both first determine whether `ptr` is a
+// pooled or general-path pointer (see the pointer-to-pool routing entry
+// in docs/design-decisions.md) and dispatch accordingly: pooled
+// deallocation/reuse is O(1) with no coalescing (pool slots have no
+// adjacent free-space concept), while general-path pointers get Phase 4's
+// coalescing and Phase 5's grow-in-place/copy-fallback realloc logic,
+// unchanged. my_calloc() layers overflow-checked zero-initialization on
+// top of my_malloc() and works identically regardless of which path
+// served the allocation. See src/allocator.cpp, docs/memory-model.md, and
+// docs/design-decisions.md for the full rationale and worked examples.
 // ---------------------------------------------------------------------------
 
 namespace allocator {
@@ -49,13 +49,15 @@ namespace allocator {
 // allocation itself fails.
 [[nodiscard]] void* my_calloc(std::size_t count, std::size_t size) noexcept;
 
-// Marks the block backing `ptr` (as returned by a prior my_malloc() call)
-// free, coalesces it with any free physical neighbors within the same
-// arena, and inserts the resulting block into the free list for future
-// reuse. `ptr` must have been returned by my_malloc() and not already
-// freed -- passing any other pointer, or double-freeing, is undefined
-// behavior (there is no double-free detection yet). A nullptr `ptr` is a
-// no-op, matching the standard free() convention.
+// Frees the allocation backing `ptr` (as returned by a prior my_malloc()/
+// my_calloc()/my_realloc() call), routing to the correct deallocation
+// path automatically depending on whether `ptr` is pooled (O(1), no
+// coalescing) or general-path (coalesces with any free physical
+// neighbors within the same arena before returning to the free list).
+// `ptr` must have been returned by this allocator and not already freed
+// -- passing any other pointer, or double-freeing, is undefined behavior
+// (there is no double-free detection yet). A nullptr `ptr` is a no-op,
+// matching the standard free() convention.
 void my_free(void* ptr) noexcept;
 
 // Resizes the allocation backing `ptr` to at least `new_size` bytes,
@@ -65,14 +67,22 @@ void my_free(void* ptr) noexcept;
 //     returned unchanged (no copy, no reallocation). This includes
 //     my_realloc(ptr, 0), a deliberate choice -- see src/allocator.cpp for
 //     why, and how it's consistent with my_malloc(0)'s existing behavior.
-//   - If growing, and ptr's free right physical neighbor (same arena)
-//     exists and is large enough, the block grows in place by absorbing
-//     it (splitting off any excess back to the free list) and the SAME
-//     pointer is returned -- no data is copied, since the payload never
-//     moved.
-//   - Otherwise, a new block is allocated via my_malloc(), the lesser of
-//     the old and new sizes is copied over, the old block is freed via
-//     my_free(), and the new pointer is returned.
+//     This holds for both pooled and general-path pointers.
+//   - If growing a GENERAL-PATH pointer, and ptr's free right physical
+//     neighbor (same arena) exists and is large enough, the block grows
+//     in place by absorbing it (splitting off any excess back to the free
+//     list) and the SAME pointer is returned -- no data is copied, since
+//     the payload never moved.
+//   - If growing a POOLED pointer, growing in place never happens --
+//     pool slots are fixed-size with no adjacent free-space concept the
+//     way general-path blocks have, so any growth beyond the current
+//     slot's capacity always falls through to the allocate+copy+free path
+//     below, even if the new size would fit in the same or a
+//     neighboring size class.
+//   - Otherwise (general-path growth with no usable neighbor, or any
+//     pooled growth), a new block is allocated via my_malloc(), the
+//     lesser of the old and new sizes is copied over, the old block is
+//     freed via my_free(), and the new pointer is returned.
 //   - If growing requires a new allocation and that allocation fails,
 //     `ptr` and its contents are left completely untouched and nullptr is
 //     returned -- a failed realloc() must never leak or corrupt the

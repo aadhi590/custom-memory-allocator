@@ -438,6 +438,17 @@ void my_free(void* ptr) noexcept {
     // Not pooled -- general-path block. Everything below is Phase 3-5's
     // existing coalescing logic, unchanged.
     BlockHeader* header = header_of(ptr);
+
+    // Defensive check: if `ptr` is neither a recognized pooled allocation
+    // (ruled out above) nor a block within a tracked general-path arena,
+    // it's not a pointer this allocator ever returned -- catch that here
+    // with an assert (compiled out under NDEBUG, like the rest of this
+    // codebase's invariant checks) rather than silently misinterpreting
+    // unrelated memory as a BlockHeader and corrupting the heap.
+    assert(arena_owning(header) != nullptr &&
+           "my_free() received a pointer that is neither a recognized pooled "
+           "allocation nor a tracked general-path arena block");
+
     header->set_free(true);
 
     // Coalesce with physical neighbors, if any are free. `merged` tracks
@@ -523,6 +534,14 @@ void* my_realloc(void* ptr, std::size_t new_size) noexcept {
     // General-path pointer -- Phase 3-5's existing realloc logic, unchanged.
     const std::size_t new_payload_size = align_up(new_size);
     BlockHeader* header = header_of(ptr);
+
+    // Same defensive check as my_free(): catch a ptr that's neither
+    // pooled nor a tracked general-path block instead of silently
+    // misinterpreting unrelated memory as a BlockHeader.
+    assert(arena_owning(header) != nullptr &&
+           "my_realloc() received a pointer that is neither a recognized pooled "
+           "allocation nor a tracked general-path arena block");
+
     const std::size_t old_payload_size = header->get_size();
 
     // realloc(ptr, 0): the C standard leaves this in
