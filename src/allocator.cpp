@@ -12,14 +12,23 @@ namespace allocator {
 
 namespace {
 
-// Size of each OS-backed arena requested via os_acquire(). Chosen as a
-// middle ground: large enough to amortize the mmap syscall (and its page
-// table setup cost) over many small allocations -- one syscall per
+// Default size of each OS-backed arena requested via os_acquire(). Chosen
+// as a middle ground: large enough to amortize the mmap syscall (and its
+// page table setup cost) over many small allocations -- one syscall per
 // allocation would dominate runtime for small sizes -- but not so large
 // that a trivial test or example program reserves an unreasonable amount of
 // address space just by calling my_malloc a handful of times. 1 MiB is a
 // common arena/chunk size in real allocators for the same reason.
-constexpr std::size_t kArenaSize = 1024 * 1024; // 1 MiB
+constexpr std::size_t kDefaultArenaSize = 1024 * 1024; // 1 MiB
+
+// The arena size actually used for future arena acquisitions. Defaults to
+// kDefaultArenaSize; overridable via set_arena_size_for_testing() so tests
+// can force deterministic, small-scale arena rollovers instead of only
+// inferring rollover correctness from allocating megabytes of data.
+std::size_t& arena_size() noexcept {
+    static std::size_t size = kDefaultArenaSize;
+    return size;
+}
 
 std::size_t align_up(std::size_t size) noexcept {
     constexpr std::size_t alignment = alignof(std::max_align_t);
@@ -60,7 +69,7 @@ Arena* arena_with_room(std::size_t needed) {
     // A single allocation larger than the standard arena size still needs
     // to succeed, so request exactly enough for it in that case rather than
     // failing outright.
-    const std::size_t request_size = needed > kArenaSize ? needed : kArenaSize;
+    const std::size_t request_size = needed > arena_size() ? needed : arena_size();
     std::optional<OsRegion> region = os_acquire(request_size);
     if (!region.has_value()) {
         return nullptr;
@@ -111,6 +120,18 @@ void allocator_shutdown() noexcept {
         [[maybe_unused]] const bool released = os_release(arena.base, arena.size);
     }
     arenas().clear();
+}
+
+void set_arena_size_for_testing(std::size_t size) noexcept {
+    arena_size() = size;
+}
+
+void reset_arena_size_for_testing() noexcept {
+    arena_size() = kDefaultArenaSize;
+}
+
+std::size_t arena_count_for_testing() noexcept {
+    return arenas().size();
 }
 
 } // namespace allocator

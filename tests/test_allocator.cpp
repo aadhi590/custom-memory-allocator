@@ -3,9 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "block.hpp"
 
 namespace {
 
@@ -13,7 +16,10 @@ namespace {
 // accumulate OS memory across the whole test binary run.
 class AllocatorTest : public ::testing::Test {
 protected:
-    void TearDown() override { allocator::allocator_shutdown(); }
+    void TearDown() override {
+        allocator::allocator_shutdown();
+        allocator::reset_arena_size_for_testing();
+    }
 };
 
 } // namespace
@@ -62,13 +68,12 @@ TEST_F(AllocatorTest, AllocationsDoNotOverlap) {
     }
 }
 
-// Exercises crossing an arena boundary. The allocator's arena size is a
-// fixed internal constant (1 MiB, see kArenaSize in allocator.cpp) that
-// isn't currently injectable from tests -- adding a configuration knob
-// purely to make this smaller felt like speculative complexity beyond what
-// this phase asked for, so instead this test allocates well past a single
-// arena's capacity (~2.4 MiB across many small allocations) to force at
-// least one new arena request organically. Correctness of every
+// Exercises crossing an arena boundary at the default (1 MiB) arena size,
+// as an additional stress-style check alongside the deterministic
+// ArenaRolloverIsDeterministicWithSmallArenaSize test below. This one
+// allocates well past a single arena's capacity (~2.4 MiB across many
+// small allocations) to force at least one new arena request organically,
+// rather than via set_arena_size_for_testing(). Correctness of every
 // allocation's contents (same technique as AllocationsDoNotOverlap above)
 // is what proves the new arena's blocks don't collide with the previous
 // arena's blocks -- if the bump pointer or arena bookkeeping were wrong
@@ -90,6 +95,49 @@ TEST_F(AllocatorTest, AllocationsSpanMultipleArenas) {
         const auto* bytes = static_cast<const unsigned char*>(ptrs[static_cast<std::size_t>(i)]);
         for (std::size_t b = 0; b < kChunkSize; ++b) {
             ASSERT_EQ(bytes[b], static_cast<unsigned char>(i & 0xFF)) << "allocation " << i << " byte " << b;
+        }
+    }
+}
+
+// Deterministic counterpart to AllocationsSpanMultipleArenas: overrides the
+// arena size to something small so the exact number of arena rollovers is
+// predictable, then asserts directly (via arena_count_for_testing()) that
+// multiple arenas were actually created, in addition to checking data
+// correctness across the rollover boundaries.
+//
+// The requested "small" arena size still gets page-rounded by os_acquire()
+// (mmap always backs a request with whole pages), so this deliberately
+// requests exactly one page rather than a literal small number like 256 --
+// requesting less than a page would silently round back up to a full page
+// and produce a much bigger, non-obvious effective arena than intended.
+// The allocation count is computed from the real page size and payload
+// size (rather than a hardcoded guess) so the test stays correct if run
+// somewhere with a different page size.
+TEST_F(AllocatorTest, ArenaRolloverIsDeterministicWithSmallArenaSize) {
+    const auto page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    allocator::set_arena_size_for_testing(page_size);
+
+    constexpr std::size_t kPayload = 64; // already alignof(std::max_align_t)-aligned
+    const std::size_t needed_per_alloc = sizeof(allocator::BlockHeader) + kPayload;
+    const std::size_t capacity_per_arena = page_size / needed_per_alloc;
+    const int kCount = static_cast<int>(capacity_per_arena * 3 + 5); // force >= 3 rollovers
+
+    std::vector<void*> ptrs;
+    ptrs.reserve(kCount);
+
+    for (int i = 0; i < kCount; ++i) {
+        void* ptr = allocator::my_malloc(kPayload);
+        ASSERT_NE(ptr, nullptr);
+        std::memset(ptr, static_cast<unsigned char>(i), kPayload);
+        ptrs.push_back(ptr);
+    }
+
+    EXPECT_GE(allocator::arena_count_for_testing(), 3u);
+
+    for (int i = 0; i < kCount; ++i) {
+        const auto* bytes = static_cast<const unsigned char*>(ptrs[static_cast<std::size_t>(i)]);
+        for (std::size_t b = 0; b < kPayload; ++b) {
+            ASSERT_EQ(bytes[b], static_cast<unsigned char>(i)) << "allocation " << i << " byte " << b;
         }
     }
 }
