@@ -5,6 +5,12 @@
 
 namespace allocator {
 
+// Forward declaration: FreeListLinks only needs pointer completeness for
+// BlockHeader (a pointer's size/representation doesn't depend on whether
+// the pointee type is complete), so it can name BlockHeader* here even
+// though the full class is defined further down in this file.
+class BlockHeader;
+
 // ---------------------------------------------------------------------------
 // BlockHeader
 //
@@ -60,9 +66,14 @@ namespace allocator {
 // Layout used to interpret the bytes immediately following a *free* block's
 // header. Meaningless (and never read) while the block is allocated -- at
 // that point the same bytes are the start of the caller's payload.
+//
+// next/prev are BlockHeader* rather than void* -- see the "FreeListLinks
+// pointer type" entry in docs/design-decisions.md for why this was chosen
+// over void* once free-list code (Phase 3) needed to actually dereference
+// these pointers.
 struct FreeListLinks {
-    void* next; // Next free block in this free list, or nullptr.
-    void* prev; // Previous free block in this free list, or nullptr.
+    BlockHeader* next; // Next free block in this free list, or nullptr.
+    BlockHeader* prev; // Previous free block in this free list, or nullptr.
 };
 
 // Trailing boundary tag. Mirrors the size stored in the block's BlockHeader
