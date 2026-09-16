@@ -37,6 +37,25 @@ std::size_t align_up(std::size_t size) noexcept {
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
+// Minimum total footprint (header + payload + footer) for a chunk of
+// memory to stand on its own as a valid free-list block. The payload
+// portion must be at least sizeof(FreeListLinks), since a free block's
+// payload bytes are reinterpreted as next/prev free-list pointers while
+// it sits in the free list (see block.hpp's FreeListLinks overlay) --
+// anything smaller couldn't even hold its own list linkage if it were
+// freed later.
+//
+// Used to decide whether splitting a found free block is worthwhile: if
+// carving out the requested size would leave a remainder smaller than
+// this, the remainder couldn't be a valid standalone block at all (it
+// couldn't hold FreeListLinks, and couldn't itself be split further), so
+// splitting is skipped and the whole block is handed over instead. This
+// trades a little internal fragmentation (the caller gets more than it
+// asked for) for guaranteeing every block that ever exists is large
+// enough to be usable -- an unsplittable sliver would be memory the
+// allocator can never reclaim or hand out again.
+constexpr std::size_t kMinBlockSize = sizeof(BlockHeader) + sizeof(FreeListLinks) + sizeof(BlockFooter);
+
 // One OS-backed region the bump allocator carves blocks out of. `used`
 // tracks the bump pointer as an offset from `base`; it only ever grows for
 // the lifetime of the arena -- freed blocks are returned via the free list
@@ -195,14 +214,33 @@ void* my_malloc(std::size_t size) noexcept {
     const std::size_t payload_size = align_up(size);
 
     // First, try to satisfy the request by reusing a previously-freed
-    // block. This phase does not split an oversized free block down to the
-    // requested size -- a free block that's larger than needed is handed
-    // over whole, wasting the remainder until Phase 4 adds splitting. This
-    // is a deliberate, documented limitation, not a bug: it's the simplest
-    // correct reuse policy, and it's what a whole-block-only free list can
-    // offer before splitting exists.
+    // block.
     if (BlockHeader* reused = free_list().find_first_fit(payload_size)) {
         free_list().remove(reused);
+
+        const std::size_t reused_size = reused->get_size();
+        const std::size_t remainder = reused_size - payload_size;
+
+        if (remainder >= kMinBlockSize) {
+            // The leftover after carving out exactly payload_size is big
+            // enough to stand on its own as a free block: shrink `reused`
+            // to the requested size and carve a new free block out of the
+            // remainder, instead of handing the whole (oversized) block
+            // over and wasting the excess.
+            reused->set_size(payload_size);
+            reused->sync_footer();
+
+            BlockHeader* remainder_header = reused->next_physical_header();
+            const std::size_t remainder_payload_size = remainder - sizeof(BlockHeader) - sizeof(BlockFooter);
+            new (static_cast<void*>(remainder_header)) BlockHeader(remainder_payload_size, /*free=*/true);
+            remainder_header->sync_footer();
+            free_list().insert(remainder_header);
+        }
+        // else: the leftover would be smaller than kMinBlockSize -- an
+        // unusable sliver that could never hold FreeListLinks or stand on
+        // its own as a block. Hand over the whole block instead (accepting
+        // a little internal fragmentation); see kMinBlockSize's comment.
+
         reused->set_free(false);
         return reused->payload();
     }
