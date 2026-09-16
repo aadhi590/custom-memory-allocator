@@ -32,8 +32,8 @@ enable_testing()
 # allocator_tests
 #
 # Only compiles test sources with real content (Phase 1: block layout;
-# Phase 2: os_memory and the bump allocator). Empty stub test files are
-# added to this target as their phases land.
+# Phase 2: os_memory and the bump allocator; Phase 3: the free list).
+# Empty stub test files are added to this target as their phases land.
 # ---------------------------------------------------------------------------
 add_executable(allocator_tests
     tests/test_block_layout.cpp
@@ -57,5 +57,6 @@ add_executable(basic_allocation
     examples/basic_allocation.cpp
     src/os_memory.cpp
     src/allocator.cpp
+    src/free_list.cpp
 )
 target_include_directories(basic_allocation PRIVATE include)

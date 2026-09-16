@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "block.hpp"
+#include "free_list.hpp"
 #include "os_memory.hpp"
 
 namespace allocator {
@@ -37,7 +38,8 @@ std::size_t align_up(std::size_t size) noexcept {
 
 // One OS-backed region the bump allocator carves blocks out of. `used`
 // tracks the bump pointer as an offset from `base`; it only ever grows for
-// the lifetime of the arena (see my_free()'s doc comment for why).
+// the lifetime of the arena -- freed blocks are returned via the free list
+// below, not by rewinding an arena's bump pointer.
 struct Arena {
     void* base;
     std::size_t size;
@@ -50,6 +52,13 @@ struct Arena {
 // Phase 8.
 std::vector<Arena>& arenas() noexcept {
     static std::vector<Arena> instance;
+    return instance;
+}
+
+// Blocks freed via my_free(), available for reuse by a future my_malloc()
+// call. Not thread-safe, same caveat as arenas() above.
+FreeList& free_list() noexcept {
+    static FreeList instance;
     return instance;
 }
 
@@ -83,6 +92,21 @@ Arena* arena_with_room(std::size_t needed) {
 
 void* my_malloc(std::size_t size) noexcept {
     const std::size_t payload_size = align_up(size);
+
+    // First, try to satisfy the request by reusing a previously-freed
+    // block. This phase does not split an oversized free block down to the
+    // requested size -- a free block that's larger than needed is handed
+    // over whole, wasting the remainder until Phase 4 adds splitting. This
+    // is a deliberate, documented limitation, not a bug: it's the simplest
+    // correct reuse policy, and it's what a whole-block-only free list can
+    // offer before splitting exists.
+    if (BlockHeader* reused = free_list().find_first_fit(payload_size)) {
+        free_list().remove(reused);
+        reused->set_free(false);
+        return reused->payload();
+    }
+
+    // No free block fit; fall back to bump-pointer allocation.
     const std::size_t needed = sizeof(BlockHeader) + payload_size;
 
     Arena* arena = arena_with_room(needed);
@@ -100,14 +124,17 @@ void* my_malloc(std::size_t size) noexcept {
 }
 
 void my_free(void* ptr) noexcept {
-    // Level 1 (Phase 2) behavior: intentional no-op. The bump-pointer
-    // allocator has no free list to return blocks to yet -- an arena's bump
-    // pointer only ever moves forward, so every allocation made in this
-    // phase is leaked (from the allocator's point of view) until the
-    // arena's memory is released wholesale by allocator_shutdown(). This is
-    // a deliberate baseline, not a forgotten implementation: Phase 3 adds
-    // the free list that makes real deallocation and block reuse possible.
-    (void)ptr;
+    if (ptr == nullptr) {
+        return;
+    }
+
+    // Recover the BlockHeader from the payload pointer -- the mirror image
+    // of how payload() computes the forward direction (header address +
+    // sizeof(BlockHeader)).
+    auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
+
+    header->set_free(true);
+    free_list().insert(header);
 }
 
 void allocator_shutdown() noexcept {
@@ -120,6 +147,11 @@ void allocator_shutdown() noexcept {
         [[maybe_unused]] const bool released = os_release(arena.base, arena.size);
     }
     arenas().clear();
+
+    // The free list holds BlockHeader* pointers into the arenas just
+    // released -- those blocks no longer exist, so the list must be reset
+    // rather than left pointing at now-unmapped memory.
+    free_list() = FreeList{};
 }
 
 void set_arena_size_for_testing(std::size_t size) noexcept {

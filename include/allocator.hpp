@@ -8,13 +8,16 @@
 // Public allocator API. This is the only header application code is meant
 // to include directly.
 //
-// Phase 2 status (Level 1 baseline): a bump-pointer allocator over
-// mmap-backed arenas (see os_memory.hpp). my_malloc() hands out memory by
-// advancing a pointer through the current arena and requesting a new arena
-// from the OS when the current one runs out of room. my_free() is an
-// intentional no-op at this phase -- freed memory is never reclaimed or
-// reused until Phase 3 introduces a free list. See src/allocator.cpp for
-// the full rationale.
+// Phase 3 status: my_malloc() first tries to satisfy a request by reusing a
+// block from the free list (see free_list.hpp); if no free block is large
+// enough, it falls back to bump-pointer allocation over mmap-backed arenas
+// (see os_memory.hpp), requesting a new arena from the OS when the current
+// one runs out of room. my_free() marks a block free and returns it to the
+// free list, making it available for reuse by a future my_malloc() call.
+// Reuse is whole-block only in this phase -- a free block larger than the
+// request is handed over as-is, with no splitting of the remainder.
+// Splitting (and coalescing adjacent free blocks back together) arrives in
+// Phase 4. See src/allocator.cpp for the full rationale.
 // ---------------------------------------------------------------------------
 
 namespace allocator {
@@ -22,13 +25,17 @@ namespace allocator {
 // Allocates at least `size` bytes and returns a pointer to the start of the
 // usable region, suitably aligned for any object type
 // (alignof(std::max_align_t)). Returns nullptr if the underlying OS memory
-// request fails.
+// request fails. Prefers reusing a free-list block over acquiring new OS
+// memory; see the file-level comment above for what "reuse" does and does
+// not do yet.
 [[nodiscard]] void* my_malloc(std::size_t size) noexcept;
 
-// Phase 2 (Level 1) behavior: intentional no-op. See src/allocator.cpp for
-// why -- this is not a placeholder that was forgotten, it's the documented
-// behavior of the bump-pointer baseline. Real deallocation arrives in
-// Phase 3.
+// Marks the block backing `ptr` (as returned by a prior my_malloc() call)
+// free and returns it to the free list for future reuse. `ptr` must have
+// been returned by my_malloc() and not already freed -- passing any other
+// pointer, or double-freeing, is undefined behavior (there is no
+// double-free detection yet). A nullptr `ptr` is a no-op, matching the
+// standard free() convention.
 void my_free(void* ptr) noexcept;
 
 // Releases every OS arena acquired via my_malloc() back to the OS. This
