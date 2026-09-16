@@ -195,3 +195,50 @@ TEST_F(ReallocTest, ReallocGrowInPlaceSplitsExcessBackToFreeList) {
         EXPECT_EQ(bytes[i], 0x66) << "byte " << i;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pooled-pointer realloc transitions (Phase 6)
+//
+// Pool slots are fixed-size with no adjacent free-space concept, so
+// growing a pooled allocation is always a copy -- see my_realloc()'s
+// pooled-pointer branch in src/allocator.cpp. These verify that
+// explicitly for the two ways a pooled allocation can grow: into a
+// different (larger) size class, and past the largest size class into
+// the general path.
+// ---------------------------------------------------------------------------
+
+TEST_F(ReallocTest, ReallocPooledPointerToDifferentSizeClassCopiesCorrectly) {
+    void* small = allocator::my_malloc(16); // pooled, 16-byte class
+    ASSERT_NE(small, nullptr);
+    ASSERT_TRUE(allocator::ptr_is_pooled_for_testing(small));
+    std::memset(small, 0x42, 16);
+
+    void* grown = allocator::my_realloc(small, 1000); // pooled, rounds to 1024-byte class
+    ASSERT_NE(grown, nullptr);
+    EXPECT_NE(grown, small); // pooled growth is always a copy, never in-place
+    EXPECT_TRUE(allocator::ptr_is_pooled_for_testing(grown));
+    EXPECT_EQ(allocator::block_payload_size_for_testing(grown), 1024u);
+
+    const auto* bytes = static_cast<const unsigned char*>(grown);
+    for (std::size_t i = 0; i < 16; ++i) {
+        EXPECT_EQ(bytes[i], 0x42) << "byte " << i;
+    }
+}
+
+TEST_F(ReallocTest, ReallocPooledPointerToGeneralPathCopiesCorrectly) {
+    void* small = allocator::my_malloc(64); // pooled, 64-byte class
+    ASSERT_NE(small, nullptr);
+    ASSERT_TRUE(allocator::ptr_is_pooled_for_testing(small));
+    std::memset(small, 0x77, 64);
+
+    void* grown = allocator::my_realloc(small, 5000); // exceeds 4096 -> general path
+    ASSERT_NE(grown, nullptr);
+    EXPECT_NE(grown, small);
+    EXPECT_FALSE(allocator::ptr_is_pooled_for_testing(grown));
+    EXPECT_EQ(allocator::block_payload_size_for_testing(grown), 5008u); // align_up(5000)
+
+    const auto* bytes = static_cast<const unsigned char*>(grown);
+    for (std::size_t i = 0; i < 64; ++i) {
+        EXPECT_EQ(bytes[i], 0x77) << "byte " << i;
+    }
+}

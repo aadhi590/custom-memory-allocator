@@ -647,7 +647,20 @@ std::size_t free_list_size_for_testing() noexcept {
 }
 
 std::size_t block_payload_size_for_testing(void* ptr) noexcept {
+    // Must check pooled status first (Phase 6): a pooled pointer's header
+    // is a PoolSlotHeader, not a BlockHeader -- interpreting it as the
+    // latter would read garbage, exactly the routing bug class this
+    // allocator's real my_free()/my_realloc() guard against.
+    auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
+    if (is_known_pool(pool_header->owning_pool)) {
+        return pool_header->owning_pool->slot_payload_size();
+    }
     return header_of(ptr)->get_size();
+}
+
+bool ptr_is_pooled_for_testing(void* ptr) noexcept {
+    auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
+    return is_known_pool(pool_header->owning_pool);
 }
 
 } // namespace allocator

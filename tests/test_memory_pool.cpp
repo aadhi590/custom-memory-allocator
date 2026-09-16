@@ -311,3 +311,26 @@ TEST_F(RoutingTest, FreeingMixedPointersReusesEachAtItsOwnCorrectAddress) {
     EXPECT_EQ(pooled_b2, pooled_b);
     EXPECT_EQ(general_a2, general_a);
 }
+
+// Regression check that Phase 6 didn't break Phase 3-5's existing
+// behavior for large allocations: a size within a size class is
+// identified as pooled, and a size exceeding the largest size class
+// still uses the general path exactly as before, verified directly via
+// ptr_is_pooled_for_testing() rather than only inferred from behavior.
+TEST_F(RoutingTest, SmallSizeIsPooledLargeSizeUsesGeneralPathUnchanged) {
+    void* small = allocator::my_malloc(100); // rounds up to the 128-byte class
+    ASSERT_NE(small, nullptr);
+    EXPECT_TRUE(allocator::ptr_is_pooled_for_testing(small));
+
+    void* exact_class = allocator::my_malloc(4096); // exactly the largest class
+    ASSERT_NE(exact_class, nullptr);
+    EXPECT_TRUE(allocator::ptr_is_pooled_for_testing(exact_class));
+
+    void* large = allocator::my_malloc(4097); // one byte over -- general path
+    ASSERT_NE(large, nullptr);
+    EXPECT_FALSE(allocator::ptr_is_pooled_for_testing(large));
+
+    void* very_large = allocator::my_malloc(1u << 20); // 1 MiB -- general path
+    ASSERT_NE(very_large, nullptr);
+    EXPECT_FALSE(allocator::ptr_is_pooled_for_testing(very_large));
+}

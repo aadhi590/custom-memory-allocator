@@ -142,4 +142,13 @@ void reset_arena_size_for_testing() noexcept;
 // size, not just its address or contents.
 [[nodiscard]] std::size_t block_payload_size_for_testing(void* ptr) noexcept;
 
+// Returns true if `ptr` (as returned by a prior my_malloc()/my_calloc()/
+// my_realloc() call) is a pooled allocation, false if it's a general-path
+// one. Exposes the same is_known_pool() check my_free()/my_realloc() use
+// internally for routing, so tests can assert directly that a given size
+// landed on the path it was expected to (e.g. a small size is pooled, a
+// large size uses the general path) rather than only inferring it
+// indirectly from behavior.
+[[nodiscard]] bool ptr_is_pooled_for_testing(void* ptr) noexcept;
+
 } // namespace allocator
