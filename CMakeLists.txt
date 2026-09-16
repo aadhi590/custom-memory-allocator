@@ -39,8 +39,10 @@ add_executable(allocator_tests
     tests/test_block_layout.cpp
     tests/test_os_memory.cpp
     tests/test_allocator.cpp
+    tests/test_free_list.cpp
     src/os_memory.cpp
     src/allocator.cpp
+    src/free_list.cpp
 )
 target_include_directories(allocator_tests PRIVATE include)
 target_link_libraries(allocator_tests PRIVATE gtest_main)
