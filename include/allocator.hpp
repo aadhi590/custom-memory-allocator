@@ -8,7 +8,7 @@
 // Public allocator API. This is the only header application code is meant
 // to include directly.
 //
-// Phase 4 status: my_malloc() first tries to satisfy a request by reusing a
+// Phase 5 status: my_malloc() first tries to satisfy a request by reusing a
 // block from the free list (see free_list.hpp). If the found block is
 // larger than needed by at least kMinBlockSize, it's split: shrunk to the
 // requested size, with the leftover carved into a new free block and
@@ -20,8 +20,12 @@
 // room. my_free() marks a block free, coalesces it with any free physical
 // neighbors (within the same arena -- see the arena-boundary-safety
 // helpers in allocator.cpp), and inserts the resulting block into the
-// free list, making it available for reuse. See src/allocator.cpp and
-// docs/memory-model.md for the full rationale and worked examples.
+// free list, making it available for reuse. my_calloc() layers
+// overflow-checked zero-initialization on top of my_malloc(); my_realloc()
+// reuses the same splitting/coalescing machinery to grow a block in place
+// when possible, falling back to allocate+copy+free otherwise. See
+// src/allocator.cpp and docs/memory-model.md for the full rationale and
+// worked examples.
 // ---------------------------------------------------------------------------
 
 namespace allocator {
@@ -53,6 +57,27 @@ namespace allocator {
 // behavior (there is no double-free detection yet). A nullptr `ptr` is a
 // no-op, matching the standard free() convention.
 void my_free(void* ptr) noexcept;
+
+// Resizes the allocation backing `ptr` to at least `new_size` bytes,
+// following the standard realloc() contract:
+//   - my_realloc(nullptr, new_size) behaves exactly like my_malloc(new_size).
+//   - If new_size already fits within ptr's current usable size, ptr is
+//     returned unchanged (no copy, no reallocation). This includes
+//     my_realloc(ptr, 0), a deliberate choice -- see src/allocator.cpp for
+//     why, and how it's consistent with my_malloc(0)'s existing behavior.
+//   - If growing, and ptr's free right physical neighbor (same arena)
+//     exists and is large enough, the block grows in place by absorbing
+//     it (splitting off any excess back to the free list) and the SAME
+//     pointer is returned -- no data is copied, since the payload never
+//     moved.
+//   - Otherwise, a new block is allocated via my_malloc(), the lesser of
+//     the old and new sizes is copied over, the old block is freed via
+//     my_free(), and the new pointer is returned.
+//   - If growing requires a new allocation and that allocation fails,
+//     `ptr` and its contents are left completely untouched and nullptr is
+//     returned -- a failed realloc() must never leak or corrupt the
+//     original allocation.
+[[nodiscard]] void* my_realloc(void* ptr, std::size_t new_size) noexcept;
 
 // Releases every OS arena acquired via my_malloc() back to the OS. This
 // exists for tests and examples that want to avoid leaking OS memory across

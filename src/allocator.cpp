@@ -407,6 +407,69 @@ void my_free(void* ptr) noexcept {
     free_list().insert(merged);
 }
 
+void* my_realloc(void* ptr, std::size_t new_size) noexcept {
+    if (ptr == nullptr) {
+        return my_malloc(new_size);
+    }
+
+    const std::size_t new_payload_size = align_up(new_size);
+    BlockHeader* header = header_of(ptr);
+    const std::size_t old_payload_size = header->get_size();
+
+    // realloc(ptr, 0): the C standard leaves this in
+    // implementation-defined/deprecated territory (freeing ptr and
+    // returning nullptr is one historical convention, but it's ambiguous
+    // -- a caller can't tell "freed successfully" apart from "the
+    // reallocation failed" from a nullptr return alone). We deliberately
+    // do NOT special-case it that way. my_malloc(0) already establishes
+    // this allocator's convention: it returns a valid, non-null pointer
+    // to a zero-payload block rather than treating size 0 as an error.
+    // Stay consistent with that here -- and conveniently, no special
+    // case is even needed: align_up(0) == 0, which always satisfies
+    // "new_payload_size <= old_payload_size" below (every existing
+    // block's size is >= 0), so my_realloc(ptr, 0) naturally falls
+    // through to "return ptr unchanged" on its own.
+    if (new_payload_size <= old_payload_size) {
+        // Already fits (a same-or-smaller request, including 0): no copy,
+        // no reallocation. This deliberately does not shrink-and-split
+        // the block down to new_payload_size -- it simply keeps the
+        // existing block as-is, trading a little internal fragmentation
+        // for avoiding an unnecessary copy on every shrink-realloc call.
+        return ptr;
+    }
+
+    // Growing. Try to grow in place first: if the right physical neighbor
+    // (within the same arena) exists, is free, and absorbing it would be
+    // large enough, merge it into this block instead of moving the data.
+    // Only the right neighbor is checked -- absorbing the left neighbor
+    // would move the payload's start address, which would defeat the
+    // "same pointer, no copy" point of growing in place at all.
+    if (BlockHeader* right = right_neighbor_if_free(header)) {
+        if (combined_payload_size(header, right) >= new_payload_size) {
+            absorb_right_neighbor(header, right);
+            // The combined block may now be larger than actually needed
+            // -- split the excess back into the free list rather than
+            // silently handing over the whole absorbed neighbor.
+            maybe_split(header, new_payload_size);
+            return ptr; // same pointer -- no data copy needed
+        }
+    }
+
+    // Grow-in-place isn't possible -- fall back to allocate + copy + free.
+    void* new_ptr = my_malloc(new_size);
+    if (new_ptr == nullptr) {
+        // Standard realloc() contract: a failed reallocation must leave
+        // the original block completely untouched. Do not free ptr, do
+        // not modify it.
+        return nullptr;
+    }
+
+    const std::size_t copy_size = old_payload_size < new_size ? old_payload_size : new_size;
+    std::memcpy(new_ptr, ptr, copy_size);
+    my_free(ptr);
+    return new_ptr;
+}
+
 void allocator_shutdown() noexcept {
     // Releases every arena acquired via my_malloc() back to the OS. Exists
     // so tests/examples can run repeatedly within one process without
