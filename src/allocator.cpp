@@ -1,5 +1,6 @@
 #include "allocator.hpp"
 
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 
 #include "block.hpp"
 #include "free_list.hpp"
+#include "memory_pool.hpp"
 #include "os_memory.hpp"
 
 namespace allocator {
@@ -82,6 +84,51 @@ std::vector<Arena>& arenas() noexcept {
 FreeList& free_list() noexcept {
     static FreeList instance;
     return instance;
+}
+
+// One Pool per size class, constructed eagerly (not lazily on first use)
+// at program start -- constructing a Pool costs nothing beyond a few
+// pointer/size_t member initializations (no OS call happens until the
+// pool's first allocate() triggers its first expand()), so there's no
+// benefit to deferring it, and eager construction means the pool
+// identities below (is_known_pool()) are stable and complete from the
+// very first my_malloc()/my_free() call -- no "was this pool constructed
+// yet" edge case to reason about.
+std::array<Pool, kNumSizeClasses>& pools() noexcept {
+    static std::array<Pool, kNumSizeClasses> instance{
+        Pool(kSizeClasses[0]), Pool(kSizeClasses[1]), Pool(kSizeClasses[2]),
+        Pool(kSizeClasses[3]), Pool(kSizeClasses[4]), Pool(kSizeClasses[5]),
+        Pool(kSizeClasses[6]), Pool(kSizeClasses[7]), Pool(kSizeClasses[8]),
+    };
+    return instance;
+}
+
+// Finds the pool for an already-computed size class (as returned by
+// size_class_for()). O(kNumSizeClasses) -- a fixed, compile-time-constant
+// scan, not a function of how many arenas or allocations exist.
+Pool* pool_for_size_class(std::size_t size_class) noexcept {
+    for (std::size_t i = 0; i < kNumSizeClasses; ++i) {
+        if (kSizeClasses[i] == size_class) {
+            return &pools()[i];
+        }
+    }
+    return nullptr; // unreachable given a size_class that came from size_class_for()
+}
+
+// Returns true if `candidate` is the address of one of this allocator's
+// own, statically-known Pool objects. See the pointer-to-pool routing
+// entry in docs/design-decisions.md for the full reasoning: this is what
+// makes my_free() able to tell "was this a pooled allocation" apart from
+// a general-path one in O(kNumSizeClasses) -- a fixed, compile-time
+// constant, not a function of how many arenas or allocations exist --
+// without needing to touch the general path's BlockHeader format at all.
+bool is_known_pool(const Pool* candidate) noexcept {
+    for (const Pool& pool : pools()) {
+        if (&pool == candidate) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Returns the arena that has room for `needed` more bytes, requesting a
@@ -281,6 +328,15 @@ void maybe_split(BlockHeader* header, std::size_t payload_size) noexcept {
 } // namespace
 
 void* my_malloc(std::size_t size) noexcept {
+    // Small, common sizes route to a fixed-size pool: O(1) allocation,
+    // zero search, zero splitting. Anything too large for any size class
+    // falls through to the general free-list/arena path below, completely
+    // unchanged from Phase 5.
+    const std::size_t size_class = size_class_for(size);
+    if (size_class != kNoSizeClass) {
+        return pool_for_size_class(size_class)->allocate();
+    }
+
     const std::size_t payload_size = align_up(size);
 
     // First, try to satisfy the request by reusing a previously-freed
@@ -363,6 +419,24 @@ void my_free(void* ptr) noexcept {
         return;
     }
 
+    // First, check whether ptr came from a pool. Pooled slots always
+    // store their owning Pool* directly in the header immediately before
+    // the payload (see memory_pool.hpp's PoolSlotHeader) -- read it
+    // speculatively and validate it against the small, fixed set of known
+    // pool addresses (is_known_pool(), O(kNumSizeClasses)). This can never
+    // produce a false positive for a genuine general-path block: a
+    // BlockHeader's first bytes store a small size value (at most a few
+    // GiB in realistic use), which can never numerically equal one of the
+    // few known Pool object addresses (those live in the program's
+    // static-storage-duration data, nowhere near small integer sizes).
+    auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
+    if (is_known_pool(pool_header->owning_pool)) {
+        pool_header->owning_pool->deallocate(ptr);
+        return;
+    }
+
+    // Not pooled -- general-path block. Everything below is Phase 3-5's
+    // existing coalescing logic, unchanged.
     BlockHeader* header = header_of(ptr);
     header->set_free(true);
 
@@ -412,6 +486,41 @@ void* my_realloc(void* ptr, std::size_t new_size) noexcept {
         return my_malloc(new_size);
     }
 
+    // Determine whether `ptr` is pooled or general-path FIRST -- the two
+    // have fundamentally different realloc strategies. See the pointer-to-
+    // pool routing reasoning in my_free() above.
+    auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
+    if (is_known_pool(pool_header->owning_pool)) {
+        const std::size_t old_payload_size = pool_header->owning_pool->slot_payload_size();
+
+        if (new_size <= old_payload_size) {
+            // Already fits within this fixed-size slot -- same pointer, no
+            // copy. Mirrors the general path's shrink-in-place behavior
+            // below, including realloc(ptr, 0)'s "return unchanged"
+            // convention (0 <= old_payload_size always holds).
+            return ptr;
+        }
+
+        // Pool slots are fixed-size with no adjacent free-space concept
+        // the way general-path blocks have -- no header/footer boundary
+        // tags, no physical-neighbor coalescing, since every slot in a
+        // pool is interchangeable rather than physically meaningful to
+        // merge with. Growing a pooled allocation is therefore ALWAYS a
+        // copy to a new allocation, never an in-place grow, regardless of
+        // how close new_size is to the next size class up or to the
+        // general path's threshold. This is a deliberate, documented
+        // behavior difference from general-path realloc() -- see
+        // docs/design-decisions.md.
+        void* new_ptr = my_malloc(new_size);
+        if (new_ptr == nullptr) {
+            return nullptr; // original pooled block left untouched
+        }
+        std::memcpy(new_ptr, ptr, old_payload_size); // old_payload_size < new_size here
+        my_free(ptr);
+        return new_ptr;
+    }
+
+    // General-path pointer -- Phase 3-5's existing realloc logic, unchanged.
     const std::size_t new_payload_size = align_up(new_size);
     BlockHeader* header = header_of(ptr);
     const std::size_t old_payload_size = header->get_size();
@@ -485,6 +594,13 @@ void allocator_shutdown() noexcept {
     // released -- those blocks no longer exist, so the list must be reset
     // rather than left pointing at now-unmapped memory.
     free_list() = FreeList{};
+
+    // Same idea for every pool: release their arenas too, so tests/
+    // examples calling allocator_shutdown() get a genuinely clean slate
+    // across both allocation paths, not just the general one.
+    for (Pool& pool : pools()) {
+        pool.release_all_arenas();
+    }
 }
 
 void set_arena_size_for_testing(std::size_t size) noexcept {

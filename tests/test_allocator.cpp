@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -71,16 +70,20 @@ TEST_F(AllocatorTest, AllocationsDoNotOverlap) {
 // Exercises crossing an arena boundary at the default (1 MiB) arena size,
 // as an additional stress-style check alongside the deterministic
 // ArenaRolloverIsDeterministicWithSmallArenaSize test below. This one
-// allocates well past a single arena's capacity (~2.4 MiB across many
-// small allocations) to force at least one new arena request organically,
+// allocates well past a single arena's capacity (~4.9 MiB across many
+// allocations) to force at least one new arena request organically,
 // rather than via set_arena_size_for_testing(). Correctness of every
 // allocation's contents (same technique as AllocationsDoNotOverlap above)
 // is what proves the new arena's blocks don't collide with the previous
 // arena's blocks -- if the bump pointer or arena bookkeeping were wrong
 // across that boundary, this test would corrupt data and fail.
+//
+// kChunkSize is deliberately > 4096 (the largest Phase 6 size class --
+// see memory_pool.hpp): anything <= 4096 now routes to a pool instead of
+// the general arena path this test is specifically exercising.
 TEST_F(AllocatorTest, AllocationsSpanMultipleArenas) {
-    constexpr std::size_t kChunkSize = 4096;
-    constexpr int kCount = 600; // ~2.4 MiB total, > one 1 MiB arena
+    constexpr std::size_t kChunkSize = 8192;
+    constexpr int kCount = 600; // ~4.9 MiB total, > one 1 MiB arena
     std::vector<void*> ptrs;
     ptrs.reserve(kCount);
 
@@ -100,29 +103,28 @@ TEST_F(AllocatorTest, AllocationsSpanMultipleArenas) {
 }
 
 // Deterministic counterpart to AllocationsSpanMultipleArenas: overrides the
-// arena size to something small so the exact number of arena rollovers is
-// predictable, then asserts directly (via arena_count_for_testing()) that
+// arena size to something small so multiple arena rollovers are forced
+// reliably, then asserts directly (via arena_count_for_testing()) that
 // multiple arenas were actually created, in addition to checking data
 // correctness across the rollover boundaries.
 //
-// The requested "small" arena size still gets page-rounded by os_acquire()
-// (mmap always backs a request with whole pages), so this deliberately
-// requests exactly one page rather than a literal small number like 256 --
-// requesting less than a page would silently round back up to a full page
-// and produce a much bigger, non-obvious effective arena than intended.
-// The allocation count is computed from the real page size and payload
-// size (rather than a hardcoded guess) so the test stays correct if run
-// somewhere with a different page size.
+// kPayload is deliberately > 4096 (the largest Phase 6 size class -- see
+// memory_pool.hpp) so every my_malloc() call here exercises the general
+// arena path this test is specifically exercising, not a pool. The forced
+// arena size is set to hold only a couple of these (comparatively large)
+// slots at a time -- os_acquire() page-rounds the actual request, but the
+// exact resulting per-arena capacity doesn't need to be hand-derived:
+// kCount is chosen generously large relative to "a couple of slots per
+// arena" that several rollovers are guaranteed regardless of the exact
+// page-rounding outcome.
 TEST_F(AllocatorTest, ArenaRolloverIsDeterministicWithSmallArenaSize) {
-    const auto page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-    allocator::set_arena_size_for_testing(page_size);
-
-    constexpr std::size_t kPayload = 64; // already alignof(std::max_align_t)-aligned
+    constexpr std::size_t kPayload = 4160; // > 4096; already alignof(std::max_align_t)-aligned
     // Every block reserves room for a BlockFooter as well as a
     // BlockHeader (Phase 4), so the per-allocation footprint includes both.
     const std::size_t needed_per_alloc = sizeof(allocator::BlockHeader) + kPayload + sizeof(allocator::BlockFooter);
-    const std::size_t capacity_per_arena = page_size / needed_per_alloc;
-    const int kCount = static_cast<int>(capacity_per_arena * 3 + 5); // force >= 3 rollovers
+    allocator::set_arena_size_for_testing(needed_per_alloc * 2);
+
+    constexpr int kCount = 50; // comfortably forces several rollovers
 
     std::vector<void*> ptrs;
     ptrs.reserve(kCount);
@@ -217,19 +219,20 @@ TEST_F(AllocatorTest, OutOfOrderFreeReusesCorrectlyWithoutCorruption) {
 
 // A freed block that's too small for a later request must not be reused
 // for it -- the request has to fall through to fresh arena/bump
-// allocation instead.
+// allocation instead. `large` is deliberately > 4096 so it exercises the
+// general path rather than a pool.
 TEST_F(AllocatorTest, RequestLargerThanAnyFreeBlockFallsThroughToArena) {
     void* small = allocator::my_malloc(16);
     ASSERT_NE(small, nullptr);
     allocator::my_free(small);
 
-    void* large = allocator::my_malloc(4096);
+    void* large = allocator::my_malloc(5000);
     ASSERT_NE(large, nullptr);
     EXPECT_NE(large, small);
 
-    std::memset(large, 0x99, 4096);
+    std::memset(large, 0x99, 5000);
     const auto* bytes = static_cast<const unsigned char*>(large);
-    for (std::size_t i = 0; i < 4096; ++i) {
+    for (std::size_t i = 0; i < 5000; ++i) {
         ASSERT_EQ(bytes[i], 0x99) << "byte " << i;
     }
 }

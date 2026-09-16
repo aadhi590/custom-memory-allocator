@@ -5,6 +5,17 @@
 
 #include <gtest/gtest.h>
 
+// Tests that specifically exercise general-path grow-in-place (via
+// coalescing a free right neighbor) use sizes deliberately kept above
+// 4096 bytes throughout -- the largest Phase 6 size class (see
+// memory_pool.hpp). Since Phase 6, my_malloc() routes anything <= 4096
+// bytes to a fixed-size pool instead of the general free-list/arena path,
+// and pooled allocations never grow in place at all (see my_realloc()'s
+// pooled-pointer branch in src/allocator.cpp) -- so a general-path
+// grow-in-place scenario has to use sizes that guarantee general-path
+// routing for every my_malloc()/my_realloc() call involved, including any
+// derived remainder sizes.
+
 namespace {
 
 class ReallocTest : public ::testing::Test {
@@ -67,22 +78,22 @@ TEST_F(ReallocTest, ReallocToSmallerSizeReturnsSamePointerWithPrefixIntact) {
 // that coincidentally preserved the data: asserts the SAME address is
 // returned, not merely correct contents.
 TEST_F(ReallocTest, ReallocGrowsInPlaceWhenRightNeighborIsFreeAndBigEnough) {
-    void* a = allocator::my_malloc(64);
-    void* b = allocator::my_malloc(64);
+    void* a = allocator::my_malloc(4160);
+    void* b = allocator::my_malloc(4160);
     ASSERT_NE(a, nullptr);
     ASSERT_NE(b, nullptr);
 
-    std::memset(a, 0x33, 64);
-    allocator::my_free(b); // a's right neighbor is now free, payload 64
+    std::memset(a, 0x33, 4160);
+    allocator::my_free(b); // a's right neighbor is now free, payload 4160
 
-    // align_up(100) == 112 > a's current 64, but combined with b
-    // (64 + 16 + 16 + 64 = 160) is large enough -- must grow in place.
-    void* grown = allocator::my_realloc(a, 100);
+    // align_up(4260) == 4272 > a's current 4160, but combined with b
+    // (4160 + 16 + 16 + 4160 = 8352) is large enough -- must grow in place.
+    void* grown = allocator::my_realloc(a, 4260);
 
     ASSERT_EQ(grown, a); // same pointer -- proves grow-in-place, not a copy
 
     const auto* bytes = static_cast<const unsigned char*>(grown);
-    for (std::size_t i = 0; i < 64; ++i) {
+    for (std::size_t i = 0; i < 4160; ++i) {
         EXPECT_EQ(bytes[i], 0x33) << "byte " << i;
     }
 }
@@ -149,33 +160,38 @@ TEST_F(ReallocTest, FailedReallocLeavesOriginalPointerAndDataUntouched) {
 // Growing in place when the free right neighbor is much larger than
 // needed must split the excess back into the free list, not silently
 // swallow the whole neighbor into the returned block.
+//
+// The remainder after splitting (8960 bytes, computed below) is itself
+// kept > 4096 so that reusing it via a later my_malloc() call stays on
+// the general path too, rather than being intercepted by a pool.
 TEST_F(ReallocTest, ReallocGrowInPlaceSplitsExcessBackToFreeList) {
-    void* a = allocator::my_malloc(64);
-    void* b = allocator::my_malloc(512);
+    void* a = allocator::my_malloc(4160);
+    void* b = allocator::my_malloc(9008);
     ASSERT_NE(a, nullptr);
     ASSERT_NE(b, nullptr);
 
-    std::memset(a, 0x66, 64);
-    allocator::my_free(b); // a's right neighbor is free, payload 512
+    std::memset(a, 0x66, 4160);
+    allocator::my_free(b); // a's right neighbor is free, payload 9008
 
-    // align_up(100) == 112, comfortably less than the full combined
-    // 64 + 16 + 16 + 512 = 608 available.
-    void* grown = allocator::my_realloc(a, 100);
+    // align_up(4200) == 4208, comfortably less than the full combined
+    // 4160 + 16 + 16 + 9008 = 13200 available.
+    void* grown = allocator::my_realloc(a, 4200);
     ASSERT_EQ(grown, a);
 
     // The returned block's reported size must match what was requested
     // (rounded up), not the full neighbor size -- proves the excess was
     // split off rather than swallowed whole.
-    EXPECT_EQ(allocator::block_payload_size_for_testing(grown), 112u);
+    EXPECT_EQ(allocator::block_payload_size_for_testing(grown), 4208u);
 
-    // The split-off remainder must be genuinely reachable through the
-    // free list, and must not overlap the grown block.
-    void* remainder_reuse = allocator::my_malloc(64);
+    // The split-off remainder (13200 - 4208 - 32 = 8960 bytes of payload)
+    // must be genuinely reachable through the free list, and must not
+    // overlap the grown block.
+    void* remainder_reuse = allocator::my_malloc(8960);
     EXPECT_NE(remainder_reuse, nullptr);
     EXPECT_NE(remainder_reuse, grown);
 
     const auto* bytes = static_cast<const unsigned char*>(grown);
-    for (std::size_t i = 0; i < 64; ++i) {
+    for (std::size_t i = 0; i < 4160; ++i) {
         EXPECT_EQ(bytes[i], 0x66) << "byte " << i;
     }
 }

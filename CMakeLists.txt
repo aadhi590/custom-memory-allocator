@@ -65,5 +65,6 @@ add_executable(basic_allocation
     src/os_memory.cpp
     src/allocator.cpp
     src/free_list.cpp
+    src/memory_pool.cpp
 )
 target_include_directories(basic_allocation PRIVATE include)
