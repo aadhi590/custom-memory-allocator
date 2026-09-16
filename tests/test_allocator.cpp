@@ -142,19 +142,93 @@ TEST_F(AllocatorTest, ArenaRolloverIsDeterministicWithSmallArenaSize) {
     }
 }
 
-TEST_F(AllocatorTest, MyFreeIsANoOpAndDoesNotCrash) {
-    void* ptr = allocator::my_malloc(64);
-    ASSERT_NE(ptr, nullptr);
-    std::memset(ptr, 0x42, 64);
+// The key proof that Phase 3 actually reuses memory rather than silently
+// falling back to fresh arena space: freeing a block and immediately
+// requesting the same size back must return the exact same address. Note
+// that my_free() overwrites the freed block's former payload bytes with
+// free-list link pointers (see FreeList::insert()), so this test does not
+// expect the *contents* to survive the free -- only the *address*.
+TEST_F(AllocatorTest, FreedBlockIsReusedAtTheSameAddressWhenSizeFits) {
+    void* first = allocator::my_malloc(64);
+    ASSERT_NE(first, nullptr);
+    std::memset(first, 0xAB, 64);
 
-    allocator::my_free(ptr);
+    allocator::my_free(first);
 
-    // Level 1 behavior: freeing does not reclaim the memory, so the
-    // contents written before the free() call must still be intact and
-    // still safe to read afterward.
-    const auto* bytes = static_cast<const unsigned char*>(ptr);
+    void* second = allocator::my_malloc(64);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second, first);
+
+    std::memset(second, 0xCD, 64);
+    const auto* bytes = static_cast<const unsigned char*>(second);
     for (std::size_t i = 0; i < 64; ++i) {
-        EXPECT_EQ(bytes[i], 0x42) << "byte " << i;
+        EXPECT_EQ(bytes[i], 0xCD) << "byte " << i;
+    }
+}
+
+// Frees in a different order than allocation (allocate A, B, C; free B,
+// then A) and verifies reuse still hands back exactly {A, B} with no
+// corruption, while C -- never freed -- keeps its original contents
+// throughout.
+TEST_F(AllocatorTest, OutOfOrderFreeReusesCorrectlyWithoutCorruption) {
+    void* a = allocator::my_malloc(64);
+    void* b = allocator::my_malloc(64);
+    void* c = allocator::my_malloc(64);
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_NE(c, nullptr);
+
+    std::memset(a, 0xAA, 64);
+    std::memset(b, 0xBB, 64);
+    std::memset(c, 0xCC, 64);
+
+    allocator::my_free(b);
+    allocator::my_free(a);
+
+    void* reused1 = allocator::my_malloc(64);
+    void* reused2 = allocator::my_malloc(64);
+    ASSERT_NE(reused1, nullptr);
+    ASSERT_NE(reused2, nullptr);
+
+    // Both reused pointers must be exactly the two freed blocks, in some
+    // order, and distinct from each other.
+    EXPECT_NE(reused1, reused2);
+    EXPECT_TRUE(reused1 == a || reused1 == b);
+    EXPECT_TRUE(reused2 == a || reused2 == b);
+
+    // c was never freed -- its contents must be untouched by any of the
+    // free-list activity around it.
+    const auto* c_bytes = static_cast<const unsigned char*>(c);
+    for (std::size_t i = 0; i < 64; ++i) {
+        ASSERT_EQ(c_bytes[i], 0xCC) << "byte " << i;
+    }
+
+    std::memset(reused1, 0x11, 64);
+    std::memset(reused2, 0x22, 64);
+    const auto* r1 = static_cast<const unsigned char*>(reused1);
+    const auto* r2 = static_cast<const unsigned char*>(reused2);
+    for (std::size_t i = 0; i < 64; ++i) {
+        ASSERT_EQ(r1[i], 0x11) << "byte " << i;
+        ASSERT_EQ(r2[i], 0x22) << "byte " << i;
+    }
+}
+
+// A freed block that's too small for a later request must not be reused
+// for it -- the request has to fall through to fresh arena/bump
+// allocation instead.
+TEST_F(AllocatorTest, RequestLargerThanAnyFreeBlockFallsThroughToArena) {
+    void* small = allocator::my_malloc(16);
+    ASSERT_NE(small, nullptr);
+    allocator::my_free(small);
+
+    void* large = allocator::my_malloc(4096);
+    ASSERT_NE(large, nullptr);
+    EXPECT_NE(large, small);
+
+    std::memset(large, 0x99, 4096);
+    const auto* bytes = static_cast<const unsigned char*>(large);
+    for (std::size_t i = 0; i < 4096; ++i) {
+        ASSERT_EQ(bytes[i], 0x99) << "byte " << i;
     }
 }
 
