@@ -8,16 +8,20 @@
 // Public allocator API. This is the only header application code is meant
 // to include directly.
 //
-// Phase 3 status: my_malloc() first tries to satisfy a request by reusing a
-// block from the free list (see free_list.hpp); if no free block is large
-// enough, it falls back to bump-pointer allocation over mmap-backed arenas
-// (see os_memory.hpp), requesting a new arena from the OS when the current
-// one runs out of room. my_free() marks a block free and returns it to the
-// free list, making it available for reuse by a future my_malloc() call.
-// Reuse is whole-block only in this phase -- a free block larger than the
-// request is handed over as-is, with no splitting of the remainder.
-// Splitting (and coalescing adjacent free blocks back together) arrives in
-// Phase 4. See src/allocator.cpp for the full rationale.
+// Phase 4 status: my_malloc() first tries to satisfy a request by reusing a
+// block from the free list (see free_list.hpp). If the found block is
+// larger than needed by at least kMinBlockSize, it's split: shrunk to the
+// requested size, with the leftover carved into a new free block and
+// reinserted into the free list. If the leftover would be too small to
+// stand on its own as a block, the whole free block is handed over
+// instead. If no free block fits at all, my_malloc() falls back to
+// bump-pointer allocation over mmap-backed arenas (see os_memory.hpp),
+// requesting a new arena from the OS when the current one runs out of
+// room. my_free() marks a block free, coalesces it with any free physical
+// neighbors (within the same arena -- see the arena-boundary-safety
+// helpers in allocator.cpp), and inserts the resulting block into the
+// free list, making it available for reuse. See src/allocator.cpp and
+// docs/memory-model.md for the full rationale and worked examples.
 // ---------------------------------------------------------------------------
 
 namespace allocator {
@@ -31,11 +35,12 @@ namespace allocator {
 [[nodiscard]] void* my_malloc(std::size_t size) noexcept;
 
 // Marks the block backing `ptr` (as returned by a prior my_malloc() call)
-// free and returns it to the free list for future reuse. `ptr` must have
-// been returned by my_malloc() and not already freed -- passing any other
-// pointer, or double-freeing, is undefined behavior (there is no
-// double-free detection yet). A nullptr `ptr` is a no-op, matching the
-// standard free() convention.
+// free, coalesces it with any free physical neighbors within the same
+// arena, and inserts the resulting block into the free list for future
+// reuse. `ptr` must have been returned by my_malloc() and not already
+// freed -- passing any other pointer, or double-freeing, is undefined
+// behavior (there is no double-free detection yet). A nullptr `ptr` is a
+// no-op, matching the standard free() convention.
 void my_free(void* ptr) noexcept;
 
 // Releases every OS arena acquired via my_malloc() back to the OS. This

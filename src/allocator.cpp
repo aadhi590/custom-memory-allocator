@@ -276,7 +276,46 @@ void my_free(void* ptr) noexcept {
     auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
 
     header->set_free(true);
-    free_list().insert(header);
+
+    // Coalesce with physical neighbors, if any are free. `merged` tracks
+    // whichever header currently represents the (possibly-growing) merged
+    // block; it starts as the block we just freed.
+    BlockHeader* merged = header;
+
+    // Coalesce right first, then coalesce the (possibly-already-grown)
+    // result with left -- this way there's only ever one merge operation
+    // in flight at a time, instead of juggling three blocks (left,
+    // this one, right) simultaneously when both neighbors are free.
+    if (BlockHeader* right = right_neighbor_if_free(merged)) {
+        free_list().remove(right);
+
+        // right's old header/payload bytes become part of merged's
+        // payload; right's old footer position becomes merged's new
+        // footer (see docs/memory-model.md for the worked-out arithmetic).
+        // No destruction needed -- BlockHeader is a trivial type, and
+        // right was already unlinked from the free list above.
+        const std::size_t combined_size = merged->get_size() + sizeof(BlockFooter) + sizeof(BlockHeader) + right->get_size();
+        merged->set_size(combined_size);
+        merged->sync_footer();
+    }
+
+    if (BlockHeader* left = left_neighbor_if_free(merged)) {
+        free_list().remove(left);
+
+        // left absorbs merged: left's header survives as the merged
+        // block's header, so its footer must reflect the new combined
+        // size (merged's own header/footer bytes become interior payload).
+        const std::size_t combined_size = left->get_size() + sizeof(BlockFooter) + sizeof(BlockHeader) + merged->get_size();
+        left->set_size(combined_size);
+        left->sync_footer();
+        merged = left;
+    }
+
+    // Exactly one insert for whatever `merged` ended up being -- the
+    // originally-freed block, that block grown to the right, grown to the
+    // left, or grown on both sides. Neighbors that were absorbed were
+    // already remove()'d above and are never separately inserted.
+    free_list().insert(merged);
 }
 
 void allocator_shutdown() noexcept {
