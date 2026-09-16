@@ -99,4 +99,12 @@ void reset_arena_size_for_testing() noexcept;
 // forgotten-remove bug would fail to satisfy.
 [[nodiscard]] std::size_t free_list_size_for_testing() noexcept;
 
+// The current payload size (get_size()) of the block backing `ptr`, as
+// returned by a prior my_malloc()/my_calloc()/my_realloc() call. Lets
+// tests verify things like "my_realloc()'s grow-in-place split the excess
+// back to the free list, rather than silently handing over an entire
+// absorbed neighbor" by checking the returned block's actual reported
+// size, not just its address or contents.
+[[nodiscard]] std::size_t block_payload_size_for_testing(void* ptr) noexcept;
+
 } // namespace allocator

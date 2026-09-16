@@ -210,39 +210,86 @@ BlockHeader* left_neighbor_if_free(BlockHeader* block) noexcept {
     return candidate;
 }
 
+// ---------------------------------------------------------------------------
+// Shared block-size / coalesce / split helpers
+//
+// Extracted so my_realloc()'s grow-in-place path (Phase 5) can reuse the
+// exact same logic my_malloc()'s splitting and my_free()'s coalescing
+// already rely on, instead of re-deriving the header/footer arithmetic a
+// third time.
+// ---------------------------------------------------------------------------
+
+// Recovers the BlockHeader from a payload pointer -- the mirror image of
+// how payload() computes the forward direction (header address +
+// sizeof(BlockHeader)). Centralizes this pointer arithmetic so it isn't
+// repeated at every call site that needs to go from a caller-visible
+// pointer back to its owning header.
+BlockHeader* header_of(void* ptr) noexcept {
+    return reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
+}
+
+// The total payload size a merged block would have if `first` (at the
+// lower address) absorbed `second` (physically immediately following
+// it): their individual payloads, plus the header+footer overhead between
+// them that becomes ordinary interior payload once merged. Pure
+// computation, no mutation -- safe to call before committing to a merge,
+// which is exactly what my_realloc() needs to decide whether growing in
+// place would even be large enough before it commits to anything.
+std::size_t combined_payload_size(const BlockHeader* first, const BlockHeader* second) noexcept {
+    return first->get_size() + sizeof(BlockFooter) + sizeof(BlockHeader) + second->get_size();
+}
+
+// Absorbs `right` (already confirmed free via right_neighbor_if_free(),
+// and therefore already a free-list member) into `block`: removes `right`
+// from the free list and grows `block`'s size/footer to cover both.
+// Does not touch `block`'s is_free() flag or insert anything into the
+// free list -- callers own that. Shared between my_free()'s
+// right-then-left coalescing and my_realloc()'s grow-in-place path.
+void absorb_right_neighbor(BlockHeader* block, BlockHeader* right) noexcept {
+    free_list().remove(right);
+    block->set_size(combined_payload_size(block, right));
+    block->sync_footer();
+}
+
+// If `header` (whose current size is already known to be >= payload_size)
+// has enough leftover beyond payload_size to stand on its own as a free
+// block, shrinks `header` to exactly payload_size and carves the leftover
+// into a new free block inserted into the free list. If the leftover
+// would be smaller than kMinBlockSize, `header` is left at its current
+// (larger) size unchanged -- see kMinBlockSize's comment for why an
+// unsplittable sliver is worse than a little internal fragmentation.
+// Shared between my_malloc()'s free-list-reuse path and my_realloc()'s
+// grow-in-place path, both of which can end up holding a block bigger
+// than what was actually requested.
+void maybe_split(BlockHeader* header, std::size_t payload_size) noexcept {
+    assert(header->get_size() >= payload_size);
+    const std::size_t remainder = header->get_size() - payload_size;
+    if (remainder < kMinBlockSize) {
+        return;
+    }
+
+    header->set_size(payload_size);
+    header->sync_footer();
+
+    BlockHeader* remainder_header = header->next_physical_header();
+    const std::size_t remainder_payload_size = remainder - sizeof(BlockHeader) - sizeof(BlockFooter);
+    new (static_cast<void*>(remainder_header)) BlockHeader(remainder_payload_size, /*free=*/true);
+    remainder_header->sync_footer();
+    free_list().insert(remainder_header);
+}
+
 } // namespace
 
 void* my_malloc(std::size_t size) noexcept {
     const std::size_t payload_size = align_up(size);
 
     // First, try to satisfy the request by reusing a previously-freed
-    // block.
+    // block. maybe_split() shrinks it and returns the leftover to the
+    // free list if the leftover is large enough to be worthwhile;
+    // otherwise the whole (oversized) block is handed over as-is.
     if (BlockHeader* reused = free_list().find_first_fit(payload_size)) {
         free_list().remove(reused);
-
-        const std::size_t reused_size = reused->get_size();
-        const std::size_t remainder = reused_size - payload_size;
-
-        if (remainder >= kMinBlockSize) {
-            // The leftover after carving out exactly payload_size is big
-            // enough to stand on its own as a free block: shrink `reused`
-            // to the requested size and carve a new free block out of the
-            // remainder, instead of handing the whole (oversized) block
-            // over and wasting the excess.
-            reused->set_size(payload_size);
-            reused->sync_footer();
-
-            BlockHeader* remainder_header = reused->next_physical_header();
-            const std::size_t remainder_payload_size = remainder - sizeof(BlockHeader) - sizeof(BlockFooter);
-            new (static_cast<void*>(remainder_header)) BlockHeader(remainder_payload_size, /*free=*/true);
-            remainder_header->sync_footer();
-            free_list().insert(remainder_header);
-        }
-        // else: the leftover would be smaller than kMinBlockSize -- an
-        // unusable sliver that could never hold FreeListLinks or stand on
-        // its own as a block. Hand over the whole block instead (accepting
-        // a little internal fragmentation); see kMinBlockSize's comment.
-
+        maybe_split(reused, payload_size);
         reused->set_free(false);
         return reused->payload();
     }
@@ -316,11 +363,7 @@ void my_free(void* ptr) noexcept {
         return;
     }
 
-    // Recover the BlockHeader from the payload pointer -- the mirror image
-    // of how payload() computes the forward direction (header address +
-    // sizeof(BlockHeader)).
-    auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
-
+    BlockHeader* header = header_of(ptr);
     header->set_free(true);
 
     // Coalesce with physical neighbors, if any are free. `merged` tracks
@@ -333,16 +376,12 @@ void my_free(void* ptr) noexcept {
     // in flight at a time, instead of juggling three blocks (left,
     // this one, right) simultaneously when both neighbors are free.
     if (BlockHeader* right = right_neighbor_if_free(merged)) {
-        free_list().remove(right);
-
         // right's old header/payload bytes become part of merged's
         // payload; right's old footer position becomes merged's new
         // footer (see docs/memory-model.md for the worked-out arithmetic).
         // No destruction needed -- BlockHeader is a trivial type, and
-        // right was already unlinked from the free list above.
-        const std::size_t combined_size = merged->get_size() + sizeof(BlockFooter) + sizeof(BlockHeader) + right->get_size();
-        merged->set_size(combined_size);
-        merged->sync_footer();
+        // absorb_right_neighbor() already unlinks right from the free list.
+        absorb_right_neighbor(merged, right);
     }
 
     if (BlockHeader* left = left_neighbor_if_free(merged)) {
@@ -351,8 +390,12 @@ void my_free(void* ptr) noexcept {
         // left absorbs merged: left's header survives as the merged
         // block's header, so its footer must reflect the new combined
         // size (merged's own header/footer bytes become interior payload).
-        const std::size_t combined_size = left->get_size() + sizeof(BlockFooter) + sizeof(BlockHeader) + merged->get_size();
-        left->set_size(combined_size);
+        // This can't reuse absorb_right_neighbor() as-is: that helper
+        // removes its second argument from the free list, but `merged`
+        // isn't a free-list member yet at this point (it's only inserted
+        // once, at the end of my_free()) -- calling remove() on it here
+        // would corrupt the list by unlinking through uninitialized links.
+        left->set_size(combined_payload_size(left, merged));
         left->sync_footer();
         merged = left;
     }
@@ -394,17 +437,19 @@ std::size_t arena_count_for_testing() noexcept {
 }
 
 bool right_neighbor_is_free_for_testing(void* ptr) noexcept {
-    auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
-    return right_neighbor_if_free(header) != nullptr;
+    return right_neighbor_if_free(header_of(ptr)) != nullptr;
 }
 
 bool left_neighbor_is_free_for_testing(void* ptr) noexcept {
-    auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
-    return left_neighbor_if_free(header) != nullptr;
+    return left_neighbor_if_free(header_of(ptr)) != nullptr;
 }
 
 std::size_t free_list_size_for_testing() noexcept {
     return free_list().size();
+}
+
+std::size_t block_payload_size_for_testing(void* ptr) noexcept {
+    return header_of(ptr)->get_size();
 }
 
 } // namespace allocator
