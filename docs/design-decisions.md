@@ -97,3 +97,50 @@ member.
   allocator is allowed to touch `size_and_flags_` directly — and by the
   round-trip tests in `tests/test_block_layout.cpp` that exercise the helpers
   across representative sizes and free/allocated states.
+
+---
+
+## Known issues / deferred hardening
+
+Items identified during the Phase 1 → Phase 2 review of `block.hpp` that are
+deliberately *not* being fixed now, tracked here so they aren't forgotten.
+None of these block Phase 2 (the bump allocator never frees, so several of
+them aren't reachable yet), but they should be revisited as the phases that
+depend on them land.
+
+1. **`FreeListLinks` uses raw `void* next/prev` instead of `BlockHeader*`.**
+   Storing the links as `BlockHeader*` would let free-list code walk the list
+   without a `reinterpret_cast` at every step. It's `void*` for now because
+   it's not yet clear whether `BlockHeader*` is safe to name inside
+   `FreeListLinks` given declaration order (`FreeListLinks` is defined above
+   `BlockHeader` in `block.hpp`), or whether `void*` was actually the
+   intentional choice to sidestep an incomplete-type issue. Revisit when
+   Phase 3's free-list code is written and this stops being hypothetical.
+
+2. **`payload()` and `free_list_links()` have no runtime invariant
+   enforcement.** The rule "`payload()` is only valid on an allocated block;
+   `free_list_links()` is only valid on a free block" is currently just a
+   documented convention in the header comment — there's no
+   `assert(is_free())` / `assert(!is_free())` guarding either accessor. A
+   caller that gets the free/allocated bookkeeping wrong today
+   compiles and runs, silently reading garbage. Worth adding asserts once
+   there's real code on both sides of the free/allocated boundary to exercise
+   them (Phase 3).
+
+3. **`set_size()` silently masks off an already-set flag bit instead of
+   asserting the precondition.** The comment above `set_size()` states the
+   precondition that the caller's size must not already have bit 0 set, but
+   the code doesn't check it — it just masks the bit off unconditionally. A
+   caller that accidentally passes an odd size (e.g. a size that wasn't
+   alignment-rounded) won't get a signal that something upstream is wrong;
+   the value is quietly truncated instead. Consider `assert((size & 0x1) ==
+   0)` once there's a debug-assertion story for the project generally.
+
+4. **`BlockHeader`'s constructor defaults `free = true`.** A `BlockHeader{size}`
+   constructed without an explicit second argument is free by default. It's
+   worth reconsidering whether defaulting to *allocated* (`free = false`)
+   is the safer failure mode: if calling code ever forgets to pass the
+   argument at a callsite that meant to construct an allocated block, the
+   current default fails open (the block looks free and reusable) rather
+   than failing closed (the block looks allocated and gets left alone until
+   someone deliberately frees it). Revisit alongside item 2 above.
