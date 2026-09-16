@@ -79,10 +79,33 @@ struct FreeListLinks {
 
 // Trailing boundary tag. Mirrors the size stored in the block's BlockHeader
 // so a neighbor can identify this block's bounds by reading backward from
-// its own header. Not yet wired into any allocation/coalescing logic.
-struct BlockFooter {
+// its own header (see BlockHeader::preceding_footer()/next_physical_header()
+// below). Wired into allocation logic from Phase 4 onward: every block,
+// free or allocated, has a footer that must be kept in sync with its
+// header's size whenever that size changes (construction, splitting,
+// coalescing) -- see docs/memory-model.md for the full worked examples.
+//
+// Forced to alignof(std::max_align_t), exactly like BlockHeader, and for
+// the same structural reason plus one more: BlockFooter's address is
+// already guaranteed 16-byte aligned (header address + sizeof(header) +
+// payload size are all multiples of 16), but the NEXT block's header sits
+// at footer address + sizeof(BlockFooter) -- if sizeof(BlockFooter) were
+// left at its natural 8 bytes (one size_t, no padding), every subsequent
+// block's header in an arena would land 8-byte-but-not-16-byte aligned,
+// violating BlockHeader's own alignas(alignof(std::max_align_t))
+// requirement. Padding BlockFooter's size up to 16 bytes keeps every
+// header in a chain of physically adjacent blocks aligned automatically,
+// at the cost of doubling the per-block footer overhead from 8 to 16
+// bytes.
+struct alignas(alignof(std::max_align_t)) BlockFooter {
     std::size_t size; // Same value as this block's BlockHeader::get_size().
 };
+
+static_assert(sizeof(BlockFooter) % alignof(std::max_align_t) == 0,
+              "BlockFooter size must be a multiple of alignof(std::max_align_t) so that "
+              "the next physical block's header stays aligned");
+static_assert(alignof(BlockFooter) == alignof(std::max_align_t),
+              "BlockFooter alignment must exactly match alignof(std::max_align_t)");
 
 // Forced to alignof(std::max_align_t): C++ guarantees sizeof(T) is always a
 // multiple of alignof(T), so this alone is what makes the static_assert
@@ -154,6 +177,77 @@ public:
         return reinterpret_cast<const FreeListLinks*>(data_address());
     }
 
+    // --- footer / physical-neighbor access -------------------------------
+    //
+    // These are pure address arithmetic based on this block's own size --
+    // they never dereference a neighboring block's memory, so they are
+    // always safe to *call*. They are NOT always safe to *dereference* the
+    // result of: a neighbor only exists if it lies within the same arena
+    // as this block, and block.hpp has no notion of arenas (that's
+    // allocator.cpp's job, via its own arena-bounds bookkeeping). Callers
+    // must verify a computed address is within the owning arena's carved
+    // region before reading through it -- see the arena-boundary-safety
+    // helpers in allocator.cpp and the worked examples in
+    // docs/memory-model.md.
+
+    // Address of this block's own footer, computed from this block's own
+    // (already-known-valid) size. Always safe to dereference: the footer
+    // is part of this block's own footprint, which the allocator
+    // guarantees is backed by real memory for any block it constructed.
+    [[nodiscard]] BlockFooter* footer() noexcept {
+        return reinterpret_cast<BlockFooter*>(reinterpret_cast<std::byte*>(this) + sizeof(BlockHeader) +
+                                               get_size());
+    }
+
+    [[nodiscard]] const BlockFooter* footer() const noexcept {
+        return reinterpret_cast<const BlockFooter*>(reinterpret_cast<const std::byte*>(this) +
+                                                      sizeof(BlockHeader) + get_size());
+    }
+
+    // Writes this block's current size into its own footer. Must be
+    // called every time this block's size changes -- initial construction,
+    // splitting, or coalescing -- so the footer never goes stale. An
+    // out-of-sync footer is worse than no footer at all: coalescing trusts
+    // a neighbor's footer to locate that neighbor's header, so a stale
+    // footer would misdirect coalescing into treating unrelated bytes as a
+    // block header.
+    void sync_footer() noexcept { footer()->size = get_size(); }
+
+    // Debug-only sanity check: true if this block's footer currently
+    // mirrors its header's size. Because a footer's stored size and its
+    // owning header's stored size are two independently-written values
+    // that must always agree by construction, this is a genuine
+    // consistency check, not a tautology -- see the assert call sites in
+    // allocator.cpp's coalescing logic, which check this on every block
+    // about to be trusted/merged rather than assuming footers are always
+    // correct.
+    [[nodiscard]] bool footer_in_sync() const noexcept { return footer()->size == get_size(); }
+
+    // Address where the PRECEDING physical block's footer would be, if one
+    // exists. Pure address arithmetic (this block's own address minus one
+    // footer's width) -- does not dereference anything, so it's always
+    // safe to call, but the caller must verify this address is within the
+    // owning arena's carved region before reading through it.
+    [[nodiscard]] BlockFooter* preceding_footer() noexcept {
+        return reinterpret_cast<BlockFooter*>(this) - 1;
+    }
+
+    [[nodiscard]] const BlockFooter* preceding_footer() const noexcept {
+        return reinterpret_cast<const BlockFooter*>(this) - 1;
+    }
+
+    // Address where the NEXT physical block's header would begin, if one
+    // exists (immediately after this block's own footer). Computed purely
+    // from this block's own size, same safety caveat as preceding_footer().
+    [[nodiscard]] BlockHeader* next_physical_header() noexcept {
+        return reinterpret_cast<BlockHeader*>(reinterpret_cast<std::byte*>(footer()) + sizeof(BlockFooter));
+    }
+
+    [[nodiscard]] const BlockHeader* next_physical_header() const noexcept {
+        return reinterpret_cast<const BlockHeader*>(reinterpret_cast<const std::byte*>(footer()) +
+                                                      sizeof(BlockFooter));
+    }
+
 private:
     static constexpr std::size_t kFreeFlagMask = 0x1;
 
@@ -185,5 +279,23 @@ static_assert(sizeof(BlockHeader) % alignof(std::max_align_t) == 0,
               "header address + sizeof(header) is automatically aligned");
 static_assert(alignof(BlockHeader) == alignof(std::max_align_t),
               "BlockHeader alignment must exactly match alignof(std::max_align_t)");
+
+// Recovers the BlockHeader* that owns `footer`, using the footer's own
+// stored size (header address = footer address - stored size -
+// sizeof(BlockHeader)). This is the one place a footer's stored value is
+// actually trusted to locate a block, rather than just mirrored into it --
+// callers (allocator.cpp's coalescing logic) are expected to sanity-check
+// the result with footer_in_sync() before relying on it further, and to
+// have already verified the footer itself lies within the owning arena's
+// carved region before calling this (block.hpp has no notion of arenas).
+[[nodiscard]] inline BlockHeader* header_from_footer(BlockFooter* footer) noexcept {
+    return reinterpret_cast<BlockHeader*>(reinterpret_cast<std::byte*>(footer) - footer->size -
+                                           sizeof(BlockHeader));
+}
+
+[[nodiscard]] inline const BlockHeader* header_from_footer(const BlockFooter* footer) noexcept {
+    return reinterpret_cast<const BlockHeader*>(reinterpret_cast<const std::byte*>(footer) - footer->size -
+                                                  sizeof(BlockHeader));
+}
 
 } // namespace allocator

@@ -1,5 +1,6 @@
 #include "allocator.hpp"
 
+#include <cassert>
 #include <cstddef>
 #include <new>
 #include <optional>
@@ -88,6 +89,106 @@ Arena* arena_with_room(std::size_t needed) {
     return &list.back();
 }
 
+// ---------------------------------------------------------------------------
+// Arena-boundary detection
+//
+// block.hpp's next_physical_header()/preceding_footer() helpers are pure
+// address arithmetic -- they compute where a neighboring block *would* be,
+// but block.hpp has no notion of arenas and so cannot know whether that
+// address actually holds a real block. A block's physical neighbor only
+// exists if it lies within the SAME arena's *carved* region
+// [arena.base, arena.base + arena.used) -- the portion that's actually
+// been placement-constructed into real BlockHeaders by bump allocation.
+// Anything at or beyond arena.used (even if still within arena.size) is
+// unwritten/uncarved space, not a block; anything before arena.base
+// belongs to a different mapping (or is unmapped) entirely.
+//
+// These helpers exist specifically so coalescing (and the arena-boundary
+// test in test_coalescing.cpp) never dereferences a computed neighbor
+// address without first confirming it's real.
+// ---------------------------------------------------------------------------
+
+// Finds the arena that owns `addr`, i.e. addr falls within that arena's
+// carved region [arena.base, arena.base + arena.used). Returns nullptr if
+// no tracked arena owns it (shouldn't happen for a block this allocator
+// itself constructed, but callers still check the result).
+const Arena* arena_owning(const void* addr) noexcept {
+    const auto* byte_addr = static_cast<const std::byte*>(addr);
+    for (const Arena& arena : arenas()) {
+        const auto* base = static_cast<const std::byte*>(arena.base);
+        if (byte_addr >= base && byte_addr < base + arena.used) {
+            return &arena;
+        }
+    }
+    return nullptr;
+}
+
+// Returns `block`'s free right neighbor if one exists within the same
+// arena, or nullptr if there is no right neighbor (block is the last
+// carved block in its arena) or the right neighbor exists but is
+// currently allocated.
+BlockHeader* right_neighbor_if_free(BlockHeader* block) noexcept {
+    const Arena* arena = arena_owning(block);
+    assert(arena != nullptr && "block does not belong to any tracked arena");
+    assert(block->footer_in_sync() && "block's footer is stale before computing its right neighbor");
+
+    BlockHeader* candidate = block->next_physical_header();
+    const auto* candidate_bytes = reinterpret_cast<const std::byte*>(candidate);
+    const auto* arena_base = static_cast<const std::byte*>(arena->base);
+    const std::byte* carved_end = arena_base + arena->used;
+
+    // The candidate header's own footprint must lie entirely within this
+    // arena's carved region before it's safe to dereference at all.
+    if (candidate_bytes < arena_base || candidate_bytes + sizeof(BlockHeader) > carved_end) {
+        return nullptr;
+    }
+
+    if (!candidate->is_free()) {
+        return nullptr;
+    }
+
+    assert(candidate->footer_in_sync() && "right neighbor's footer is stale");
+    return candidate;
+}
+
+// Returns `block`'s free left neighbor if one exists within the same
+// arena, or nullptr if there is no left neighbor (block is the first
+// carved block in its arena) or the left neighbor exists but is currently
+// allocated.
+BlockHeader* left_neighbor_if_free(BlockHeader* block) noexcept {
+    const Arena* arena = arena_owning(block);
+    assert(arena != nullptr && "block does not belong to any tracked arena");
+    assert(block->footer_in_sync() && "block's footer is stale before computing its left neighbor");
+
+    const auto* arena_base = static_cast<const std::byte*>(arena->base);
+    const auto* block_bytes = reinterpret_cast<const std::byte*>(block);
+
+    // Reading the preceding footer requires sizeof(BlockFooter) bytes
+    // immediately before this block's header to exist within the arena.
+    if (block_bytes - sizeof(BlockFooter) < arena_base) {
+        return nullptr;
+    }
+
+    BlockFooter* prev_footer = block->preceding_footer();
+    BlockHeader* candidate = header_from_footer(prev_footer);
+    const auto* candidate_bytes = reinterpret_cast<const std::byte*>(candidate);
+
+    // The address header_from_footer() computed (from the footer's own
+    // stored size) must itself land within the arena's carved region and
+    // strictly before `block` -- otherwise the footer's stored size was
+    // corrupt/stale, and trusting it further would be unsafe.
+    if (candidate_bytes < arena_base || candidate_bytes >= block_bytes) {
+        return nullptr;
+    }
+
+    if (!candidate->is_free()) {
+        return nullptr;
+    }
+
+    assert(candidate->footer_in_sync() && "left neighbor's footer is stale");
+    return candidate;
+}
+
 } // namespace
 
 void* my_malloc(std::size_t size) noexcept {
@@ -106,8 +207,10 @@ void* my_malloc(std::size_t size) noexcept {
         return reused->payload();
     }
 
-    // No free block fit; fall back to bump-pointer allocation.
-    const std::size_t needed = sizeof(BlockHeader) + payload_size;
+    // No free block fit; fall back to bump-pointer allocation. Every block
+    // now carries a footer as well as a header (Phase 4), so room for both
+    // must be reserved up front.
+    const std::size_t needed = sizeof(BlockHeader) + payload_size + sizeof(BlockFooter);
 
     Arena* arena = arena_with_room(needed);
     if (arena == nullptr) {
@@ -118,6 +221,7 @@ void* my_malloc(std::size_t size) noexcept {
     // Placement-construct the header at the bump pointer, marked allocated
     // (not free) since it's being handed out immediately.
     auto* header = new (block_addr) BlockHeader(payload_size, /*free=*/false);
+    header->sync_footer();
     arena->used += needed;
 
     return header->payload();
@@ -164,6 +268,16 @@ void reset_arena_size_for_testing() noexcept {
 
 std::size_t arena_count_for_testing() noexcept {
     return arenas().size();
+}
+
+bool right_neighbor_is_free_for_testing(void* ptr) noexcept {
+    auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
+    return right_neighbor_if_free(header) != nullptr;
+}
+
+bool left_neighbor_is_free_for_testing(void* ptr) noexcept {
+    auto* header = reinterpret_cast<BlockHeader*>(static_cast<std::byte*>(ptr) - sizeof(BlockHeader));
+    return left_neighbor_if_free(header) != nullptr;
 }
 
 } // namespace allocator

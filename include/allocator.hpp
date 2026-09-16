@@ -67,4 +67,14 @@ void reset_arena_size_for_testing() noexcept;
 // release). Lets tests assert directly that a rollover created a new arena.
 [[nodiscard]] std::size_t arena_count_for_testing() noexcept;
 
+// Returns true if the block backing `ptr` (as returned by a prior
+// my_malloc() call) has a free right/left physical neighbor within the
+// same arena. `ptr`'s own block may be allocated or free -- these only
+// inspect the neighbor. Exists to test the arena-boundary-safe neighbor
+// detection Phase 4's coalescing is built on (see the arena-boundary-safety
+// helpers in allocator.cpp) independently of the coalescing logic itself,
+// so the two can be verified separately.
+[[nodiscard]] bool right_neighbor_is_free_for_testing(void* ptr) noexcept;
+[[nodiscard]] bool left_neighbor_is_free_for_testing(void* ptr) noexcept;
+
 } // namespace allocator

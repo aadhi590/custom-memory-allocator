@@ -118,7 +118,9 @@ TEST_F(AllocatorTest, ArenaRolloverIsDeterministicWithSmallArenaSize) {
     allocator::set_arena_size_for_testing(page_size);
 
     constexpr std::size_t kPayload = 64; // already alignof(std::max_align_t)-aligned
-    const std::size_t needed_per_alloc = sizeof(allocator::BlockHeader) + kPayload;
+    // Every block reserves room for a BlockFooter as well as a
+    // BlockHeader (Phase 4), so the per-allocation footprint includes both.
+    const std::size_t needed_per_alloc = sizeof(allocator::BlockHeader) + kPayload + sizeof(allocator::BlockFooter);
     const std::size_t capacity_per_arena = page_size / needed_per_alloc;
     const int kCount = static_cast<int>(capacity_per_arena * 3 + 5); // force >= 3 rollovers
 
