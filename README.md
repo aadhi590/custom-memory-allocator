@@ -19,25 +19,28 @@ tradeoffs rather than a black-box wrapper around `malloc`.
 
 ## Current status
 
-**Phase 0-5 complete** — block metadata, a real `mmap`-backed allocator with
-free-list reuse, block splitting/coalescing, and `calloc`/`realloc`.
+**Phase 0-6 complete** — block metadata, a real `mmap`-backed general
+allocator with free-list reuse, splitting/coalescing, `calloc`/`realloc`,
+and now a second, pooled allocation path for small, common sizes.
 
-`my_malloc`/`my_free` (`include/allocator.hpp`) are backed by `os_memory`'s
-`mmap`/`munmap` wrapper, a doubly-linked free list (`include/free_list.hpp`)
-searched first-fit, and `include/block.hpp`'s `BlockHeader`/`BlockFooter`
-boundary-tag pair. `my_malloc` reuses a free block when one fits, splitting
-it if the leftover is large enough to stand on its own; `my_free` marks a
-block free and coalesces it with any free physical neighbors within the same
-arena before returning it to the free list. `my_calloc` layers
-overflow-checked, always-unconditional zero-initialization on top of
-`my_malloc`; `my_realloc` reuses the same splitting/coalescing machinery to
-grow a block in place when its free right neighbor is large enough, falling
-back to allocate+copy+free otherwise. See
+`my_malloc`/`my_free` (`include/allocator.hpp`) route through two paths.
+Small, common sizes (<= 4096 bytes, rounded up to one of 9 fixed size
+classes) go to `include/memory_pool.hpp`'s `Pool`: O(1) allocation and
+deallocation with zero search, zero splitting, zero coalescing. Everything
+larger uses the general path, unchanged from Phase 5: `os_memory`'s
+`mmap`/`munmap` wrapper, a doubly-linked free list
+(`include/free_list.hpp`) searched first-fit, and `include/block.hpp`'s
+`BlockHeader`/`BlockFooter` boundary-tag pair, with splitting/coalescing
+and `calloc`/`realloc` all working exactly as in Phase 5. `my_free()`/
+`my_realloc()` identify which path a pointer came from via a validated
+pool-ownership tag (O(1) in the number of size classes, not the number of
+arenas) rather than an address-range search. See
 [docs/memory-model.md](docs/memory-model.md) for the full block-layout
 explanation plus worked examples of splitting and coalescing, and
-[docs/design-decisions.md](docs/design-decisions.md) for the reasoning behind
-specific choices. Caller-requested alignment beyond the default, multiple
-concurrent memory pools, and thread safety don't exist yet.
+[docs/design-decisions.md](docs/design-decisions.md) for the reasoning
+behind specific choices, including the pointer-to-pool routing decision.
+Caller-requested alignment beyond the default and thread safety don't
+exist yet.
 
 ## Build instructions
 
@@ -54,8 +57,8 @@ Debug is the default.
 ## Repository layout
 
 ```
-include/     public headers (block.hpp, allocator.hpp, free_list.hpp, os_memory.hpp have real content)
-src/         implementation files (allocator.cpp, free_list.cpp, os_memory.cpp have real content)
+include/     public headers (block.hpp, allocator.hpp, free_list.hpp, os_memory.hpp, memory_pool.hpp have real content)
+src/         implementation files (allocator.cpp, free_list.cpp, os_memory.cpp, memory_pool.cpp have real content)
 tests/       GoogleTest test suites
 benchmarks/  throughput/fragmentation benchmarks (Phase 9+)
 examples/    example programs using the allocator (basic_allocation.cpp)
@@ -86,7 +89,7 @@ for the full rationale and exactly what was cut.
 - [x] **Phase 5** — `my_calloc`/`my_realloc`: overflow-checked, always-zeroed
       calloc; realloc with in-place growth/shrink via Phase 4's
       splitting/coalescing where possible, allocate+copy+free otherwise.
-- [ ] **Phase 6** — Memory pools / size classes: fixed-size slot pools for
+- [x] **Phase 6** — Memory pools / size classes: fixed-size slot pools for
       small, common allocation sizes as a second, O(1) allocation path
       alongside the general free-list allocator (which continues to handle
       everything above the largest size class).
