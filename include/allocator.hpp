@@ -34,6 +34,17 @@ namespace allocator {
 // not do yet.
 [[nodiscard]] void* my_malloc(std::size_t size) noexcept;
 
+// Allocates storage for `count` objects of `size` bytes each and
+// zero-initializes the entire region, matching the standard calloc()
+// contract. Detects count * size multiplication overflow before
+// allocating anything and returns nullptr in that case -- this is real,
+// defined failure behavior, not undefined behavior; see src/allocator.cpp
+// for the overflow-check approach and why it matters (a naive
+// malloc(count * size) that silently wraps around is a classic real-world
+// calloc vulnerability class). Also returns nullptr if the underlying
+// allocation itself fails.
+[[nodiscard]] void* my_calloc(std::size_t count, std::size_t size) noexcept;
+
 // Marks the block backing `ptr` (as returned by a prior my_malloc() call)
 // free, coalesces it with any free physical neighbors within the same
 // arena, and inserts the resulting block into the free list for future

@@ -2,6 +2,8 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <new>
 #include <optional>
 #include <vector>
@@ -263,6 +265,50 @@ void* my_malloc(std::size_t size) noexcept {
     arena->used += needed;
 
     return header->payload();
+}
+
+void* my_calloc(std::size_t count, std::size_t size) noexcept {
+    // Overflow check: a manual "would count * size exceed SIZE_MAX"
+    // division check, rather than a compiler builtin like
+    // __builtin_mul_overflow. Chosen because it's portable standard C++
+    // (no GCC/Clang-specific dependency for a single use site) and
+    // equally exact -- integer division truncates, so
+    // count > SIZE_MAX / size is true exactly when count * size would
+    // exceed SIZE_MAX, given size != 0. This is the classic calloc
+    // integer-overflow vulnerability class: a naive
+    // my_malloc(count * size) that lets the multiplication silently wrap
+    // around would allocate a tiny buffer while the caller believes they
+    // got count * size bytes, and the caller's first write past the real
+    // (tiny) allocation becomes a heap overflow. Returning nullptr here is
+    // real, defined failure behavior -- not a crash, not UB.
+    if (size != 0 && count > SIZE_MAX / size) {
+        return nullptr;
+    }
+
+    const std::size_t total = count * size;
+    void* ptr = my_malloc(total);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+
+    // Always zero unconditionally. It is tempting to skip this when the
+    // memory obviously came from a fresh arena page (mmap's
+    // MAP_ANONYMOUS pages are zeroed by the kernel), but that's only true
+    // for brand-new bump-carved memory -- NOT for a block reused from the
+    // free list. A reused block can carry leftover FreeListLinks
+    // next/prev pointer bytes in its first sizeof(FreeListLinks) bytes
+    // (written by FreeList::insert() while it sat free) or simply a
+    // previous caller's stale payload data further in. Special-casing
+    // "skip the memset because this must be zeroed already" is a real,
+    // silent bug class: it would work by coincidence for fresh-arena
+    // memory and corrupt the calloc contract the very first time the
+    // fast path handed back a reused block instead, with no crash to
+    // signal it -- just a caller reading garbage where they expected
+    // zeros. See the FreshArenaMemoryIsZeroed/ReusedFreedBlockIsZeroed
+    // tests in test_allocator.cpp, which specifically force the reused
+    // case to prove this.
+    std::memset(ptr, 0, total);
+    return ptr;
 }
 
 void my_free(void* ptr) noexcept {
