@@ -244,3 +244,71 @@ TEST_F(AllocatorTest, AllocatorShutdownAllowsFreshAllocationsAfterward) {
     ASSERT_NE(after, nullptr);
     std::memset(after, 0x1, 128);
 }
+
+// ---------------------------------------------------------------------------
+// my_calloc
+// ---------------------------------------------------------------------------
+
+// The first allocation in a fresh test run comes straight from a
+// freshly-mmap'd arena, never touched by the free list -- mmap's
+// MAP_ANONYMOUS pages are already zeroed by the kernel, but calloc must
+// still report zeroed memory regardless of how it got that way.
+TEST_F(AllocatorTest, CallocZeroesFreshArenaMemory) {
+    void* ptr = allocator::my_calloc(16, sizeof(std::uint64_t));
+    ASSERT_NE(ptr, nullptr);
+
+    const auto* bytes = static_cast<const unsigned char*>(ptr);
+    for (std::size_t i = 0; i < 16 * sizeof(std::uint64_t); ++i) {
+        EXPECT_EQ(bytes[i], 0) << "byte " << i;
+    }
+}
+
+// calloc must zero memory even when it comes from a reused freed block,
+// which can carry leftover FreeListLinks pointer bytes (from
+// FreeList::insert() while it sat free) or a previous caller's stale
+// payload data -- NOT just memory fresh from the OS. This forces the
+// reuse case explicitly: dirty and free a block, then calloc a size that
+// lands on that exact freed block, proven by checking the returned
+// address matches.
+TEST_F(AllocatorTest, CallocZeroesReusedFreedBlockMemory) {
+    constexpr std::size_t kSize = 128;
+    void* dirtied = allocator::my_malloc(kSize);
+    ASSERT_NE(dirtied, nullptr);
+    std::memset(dirtied, 0xFF, kSize);
+
+    allocator::my_free(dirtied);
+
+    void* reused = allocator::my_calloc(1, kSize);
+    ASSERT_NE(reused, nullptr);
+    ASSERT_EQ(reused, dirtied); // proves this really is the reused block
+
+    const auto* bytes = static_cast<const unsigned char*>(reused);
+    for (std::size_t i = 0; i < kSize; ++i) {
+        EXPECT_EQ(bytes[i], 0) << "byte " << i;
+    }
+}
+
+// count * size deliberately chosen to overflow size_t. Must return
+// nullptr without crashing or corrupting allocator state -- verified by
+// checking a normal allocation still works correctly afterward.
+TEST_F(AllocatorTest, CallocOverflowReturnsNullptrSafely) {
+    constexpr std::size_t kHugeCount = SIZE_MAX / 2 + 1;
+    constexpr std::size_t kHugeSize = 4;
+
+    void* ptr = allocator::my_calloc(kHugeCount, kHugeSize);
+    EXPECT_EQ(ptr, nullptr);
+
+    void* normal = allocator::my_malloc(64);
+    ASSERT_NE(normal, nullptr);
+    std::memset(normal, 0x5A, 64);
+    const auto* bytes = static_cast<const unsigned char*>(normal);
+    for (std::size_t i = 0; i < 64; ++i) {
+        ASSERT_EQ(bytes[i], 0x5A) << "byte " << i;
+    }
+}
+
+TEST_F(AllocatorTest, CallocWithZeroSizeOrCountDoesNotOverflowOrCrash) {
+    EXPECT_NE(allocator::my_calloc(0, 64), nullptr);
+    EXPECT_NE(allocator::my_calloc(64, 0), nullptr);
+    EXPECT_NE(allocator::my_calloc(0, 0), nullptr);
+}
