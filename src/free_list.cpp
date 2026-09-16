@@ -47,4 +47,12 @@ BlockHeader* FreeList::find_first_fit(std::size_t size) const noexcept {
     return nullptr;
 }
 
+std::size_t FreeList::size() const noexcept {
+    std::size_t count = 0;
+    for (BlockHeader* block = head_; block != nullptr; block = block->free_list_links()->next) {
+        ++count;
+    }
+    return count;
+}
+
 } // namespace allocator

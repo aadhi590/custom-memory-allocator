@@ -222,3 +222,36 @@ TEST(FreeListTest, FindFirstFitAcceptsExactSizeMatch) {
 
     EXPECT_EQ(list.find_first_fit(64), header);
 }
+
+// ---------------------------------------------------------------------------
+// size()
+// ---------------------------------------------------------------------------
+
+TEST(FreeListTest, SizeOfEmptyListIsZero) {
+    FreeList list;
+    EXPECT_EQ(list.size(), 0u);
+}
+
+TEST(FreeListTest, SizeTracksInsertsAndRemoves) {
+    FakeBlock block_a, block_b, block_c;
+    BlockHeader* a = make_free_block(block_a, 16);
+    BlockHeader* b = make_free_block(block_b, 32);
+    BlockHeader* c = make_free_block(block_c, 48);
+
+    FreeList list;
+    EXPECT_EQ(list.size(), 0u);
+
+    list.insert(a);
+    EXPECT_EQ(list.size(), 1u);
+    list.insert(b);
+    EXPECT_EQ(list.size(), 2u);
+    list.insert(c);
+    EXPECT_EQ(list.size(), 3u);
+
+    list.remove(b);
+    EXPECT_EQ(list.size(), 2u);
+    list.remove(a);
+    EXPECT_EQ(list.size(), 1u);
+    list.remove(c);
+    EXPECT_EQ(list.size(), 0u);
+}

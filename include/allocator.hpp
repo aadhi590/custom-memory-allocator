@@ -82,4 +82,10 @@ void reset_arena_size_for_testing() noexcept;
 [[nodiscard]] bool right_neighbor_is_free_for_testing(void* ptr) noexcept;
 [[nodiscard]] bool left_neighbor_is_free_for_testing(void* ptr) noexcept;
 
+// Number of blocks currently linked into the internal free list. Lets
+// coalescing tests assert precisely that a merge left exactly one entry
+// behind, not two or three -- exactly the shape a double-insert or
+// forgotten-remove bug would fail to satisfy.
+[[nodiscard]] std::size_t free_list_size_for_testing() noexcept;
+
 } // namespace allocator

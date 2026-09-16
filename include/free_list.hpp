@@ -43,6 +43,14 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return head_ == nullptr; }
 
+    // Number of blocks currently linked into this list. O(n) -- walks the
+    // full list, so this is a diagnostics/testing helper, not a hot path.
+    // Exists so coalescing (Phase 4) can be verified precisely -- e.g.
+    // confirming a merge left exactly one entry behind, not two or three,
+    // which is exactly the shape a double-insert or forgotten-remove bug
+    // would fail to satisfy.
+    [[nodiscard]] std::size_t size() const noexcept;
+
 private:
     BlockHeader* head_ = nullptr;
 };

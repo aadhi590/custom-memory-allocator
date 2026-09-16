@@ -357,4 +357,8 @@ bool left_neighbor_is_free_for_testing(void* ptr) noexcept {
     return left_neighbor_if_free(header) != nullptr;
 }
 
+std::size_t free_list_size_for_testing() noexcept {
+    return free_list().size();
+}
+
 } // namespace allocator
