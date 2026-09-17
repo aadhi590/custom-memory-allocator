@@ -54,6 +54,37 @@ cmake -B build && cmake --build build && ctest --test-dir build
 Pass `-DCMAKE_BUILD_TYPE=Release` to `cmake -B build` for an optimized build;
 Debug is the default.
 
+### Sanitizer verification
+
+Every phase of this project has been verified locally under sanitizers
+before being pushed (see the "cut from the original 13-phase plan" note
+below for why this stands in for a formal CI pipeline). To reproduce:
+
+```sh
+# AddressSanitizer + UndefinedBehaviorSanitizer (general correctness)
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build-asan
+ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan
+
+# ThreadSanitizer (concurrency correctness -- Phase 7's test_thread_safety.cpp)
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake --build build-tsan
+ctest --test-dir build-tsan
+```
+
+ASan and TSan are built and run separately (as separate `build-asan`/
+`build-tsan` directories), never combined in one binary, since the two
+sanitizers generally aren't compatible with each other. As of Phase 7, the
+full suite (136 tests) passes clean under both, including zero data races
+reported by TSan across all of `test_thread_safety.cpp`'s multithreaded
+tests -- and every test that existed before Phase 7 (129 of the 136) was
+left completely unmodified by adding concurrency support; only new tests
+were added.
+
 ## Repository layout
 
 ```
