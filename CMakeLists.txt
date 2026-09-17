@@ -98,3 +98,13 @@ foreach(STAGE 1 2 3)
     target_link_libraries(benchmark_allocator_stage${STAGE} PRIVATE Threads::Threads)
     target_compile_definitions(benchmark_allocator_stage${STAGE} PRIVATE ALLOCATOR_CONCURRENCY_STAGE=${STAGE})
 endforeach()
+
+add_executable(benchmark_fragmentation
+    benchmarks/benchmark_fragmentation.cpp
+    src/os_memory.cpp
+    src/allocator.cpp
+    src/free_list.cpp
+    src/memory_pool.cpp
+)
+target_include_directories(benchmark_fragmentation PRIVATE include)
+target_link_libraries(benchmark_fragmentation PRIVATE Threads::Threads)
