@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <vector>
@@ -17,6 +18,27 @@
 namespace allocator {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Concurrency: Stage 1 -- single global mutex.
+//
+// The simplest possible correct concurrent version, and the baseline every
+// later concurrency stage is compared against in Part B's benchmarks: ONE
+// mutex covers ALL allocator state (every pool plus the general free-list/
+// arena path). Every public entry point (my_malloc/my_free; my_calloc and
+// my_realloc get correctness by calling the now-locked my_malloc()/
+// my_free() rather than touching shared state directly, except for
+// my_realloc's grow-in-place path, which takes this same mutex directly
+// for the short span where it manipulates the free list itself) acquires
+// this one lock for its entire body. No two allocator operations can ever
+// run concurrently under this stage, regardless of which pool or path
+// they'd otherwise touch -- correctness is trivial to see by inspection,
+// at the cost of zero parallelism.
+// ---------------------------------------------------------------------------
+std::mutex& g_global_mutex() noexcept {
+    static std::mutex instance;
+    return instance;
+}
 
 // Default size of each OS-backed arena requested via os_acquire(). Chosen
 // as a middle ground: large enough to amortize the mmap syscall (and its
@@ -328,6 +350,8 @@ void maybe_split(BlockHeader* header, std::size_t payload_size) noexcept {
 } // namespace
 
 void* my_malloc(std::size_t size) noexcept {
+    std::lock_guard<std::mutex> guard(g_global_mutex());
+
     // Small, common sizes route to a fixed-size pool: O(1) allocation,
     // zero search, zero splitting. Anything too large for any size class
     // falls through to the general free-list/arena path below, completely
@@ -419,6 +443,8 @@ void my_free(void* ptr) noexcept {
         return;
     }
 
+    std::lock_guard<std::mutex> guard(g_global_mutex());
+
     // First, check whether ptr came from a pool. Pooled slots always
     // store their owning Pool* directly in the header immediately before
     // the payload (see memory_pool.hpp's PoolSlotHeader) -- read it
@@ -494,96 +520,112 @@ void my_free(void* ptr) noexcept {
 
 void* my_realloc(void* ptr, std::size_t new_size) noexcept {
     if (ptr == nullptr) {
-        return my_malloc(new_size);
+        return my_malloc(new_size); // locks internally
     }
 
-    // Determine whether `ptr` is pooled or general-path FIRST -- the two
-    // have fundamentally different realloc strategies. See the pointer-to-
-    // pool routing reasoning in my_free() above.
+    // Determine whether `ptr` is pooled or general-path, and whether the
+    // request can be satisfied without moving the data, all under one
+    // lock scope -- released before falling through to my_malloc()/
+    // my_free() below (which each acquire this same mutex themselves;
+    // holding it across those calls would deadlock on this non-reentrant
+    // mutex). See the pointer-to-pool routing reasoning in my_free()
+    // above for what the speculative tag read means.
     auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
-    if (is_known_pool(pool_header->owning_pool)) {
-        const std::size_t old_payload_size = pool_header->owning_pool->slot_payload_size();
+    std::size_t old_payload_size = 0;
+    bool grew_in_place = false;
+    {
+        std::lock_guard<std::mutex> guard(g_global_mutex());
 
-        if (new_size <= old_payload_size) {
-            // Already fits within this fixed-size slot -- same pointer, no
-            // copy. Mirrors the general path's shrink-in-place behavior
-            // below, including realloc(ptr, 0)'s "return unchanged"
-            // convention (0 <= old_payload_size always holds).
-            return ptr;
-        }
+        if (is_known_pool(pool_header->owning_pool)) {
+            old_payload_size = pool_header->owning_pool->slot_payload_size();
 
-        // Pool slots are fixed-size with no adjacent free-space concept
-        // the way general-path blocks have -- no header/footer boundary
-        // tags, no physical-neighbor coalescing, since every slot in a
-        // pool is interchangeable rather than physically meaningful to
-        // merge with. Growing a pooled allocation is therefore ALWAYS a
-        // copy to a new allocation, never an in-place grow, regardless of
-        // how close new_size is to the next size class up or to the
-        // general path's threshold. This is a deliberate, documented
-        // behavior difference from general-path realloc() -- see
-        // docs/design-decisions.md.
-        void* new_ptr = my_malloc(new_size);
-        if (new_ptr == nullptr) {
-            return nullptr; // original pooled block left untouched
+            if (new_size <= old_payload_size) {
+                // Already fits within this fixed-size slot -- same
+                // pointer, no copy. Mirrors the general path's
+                // shrink-in-place behavior below, including
+                // realloc(ptr, 0)'s "return unchanged" convention
+                // (0 <= old_payload_size always holds).
+                return ptr;
+            }
+
+            // Pool slots are fixed-size with no adjacent free-space
+            // concept the way general-path blocks have -- no
+            // header/footer boundary tags, no physical-neighbor
+            // coalescing, since every slot in a pool is interchangeable
+            // rather than physically meaningful to merge with. Growing a
+            // pooled allocation is therefore ALWAYS a copy to a new
+            // allocation, never an in-place grow, regardless of how
+            // close new_size is to the next size class up or to the
+            // general path's threshold. This is a deliberate, documented
+            // behavior difference from general-path realloc() -- see
+            // docs/design-decisions.md. `grew_in_place` stays false, so
+            // control falls through to the copy path below.
+        } else {
+            BlockHeader* header = header_of(ptr);
+
+            // Defensive check: catch a ptr that's neither pooled nor a
+            // tracked general-path block instead of silently
+            // misinterpreting unrelated memory as a BlockHeader.
+            assert(arena_owning(header) != nullptr &&
+                   "my_realloc() received a pointer that is neither a recognized pooled "
+                   "allocation nor a tracked general-path arena block");
+
+            old_payload_size = header->get_size();
+
+            // realloc(ptr, 0): the C standard leaves this in
+            // implementation-defined/deprecated territory (freeing ptr
+            // and returning nullptr is one historical convention, but
+            // it's ambiguous -- a caller can't tell "freed successfully"
+            // apart from "the reallocation failed" from a nullptr return
+            // alone). We deliberately do NOT special-case it that way.
+            // my_malloc(0) already establishes this allocator's
+            // convention: it returns a valid, non-null pointer to a
+            // zero-payload block rather than treating size 0 as an
+            // error. Stay consistent with that here -- and conveniently,
+            // no special case is even needed: align_up(0) == 0, which
+            // always satisfies "new_payload_size <= old_payload_size"
+            // below (every existing block's size is >= 0), so
+            // my_realloc(ptr, 0) naturally falls through to "return ptr
+            // unchanged" on its own.
+            const std::size_t new_payload_size = align_up(new_size);
+            if (new_payload_size <= old_payload_size) {
+                // Already fits (a same-or-smaller request, including 0):
+                // no copy, no reallocation. This deliberately does not
+                // shrink-and-split the block down to new_payload_size --
+                // it simply keeps the existing block as-is, trading a
+                // little internal fragmentation for avoiding an
+                // unnecessary copy on every shrink-realloc call.
+                return ptr;
+            }
+
+            // Growing. Try to grow in place first: if the right physical
+            // neighbor (within the same arena) exists, is free, and
+            // absorbing it would be large enough, merge it into this
+            // block instead of moving the data. Only the right neighbor
+            // is checked -- absorbing the left neighbor would move the
+            // payload's start address, which would defeat the "same
+            // pointer, no copy" point of growing in place at all.
+            if (BlockHeader* right = right_neighbor_if_free(header)) {
+                if (combined_payload_size(header, right) >= new_payload_size) {
+                    absorb_right_neighbor(header, right);
+                    // The combined block may now be larger than actually
+                    // needed -- split the excess back into the free list
+                    // rather than silently handing over the whole
+                    // absorbed neighbor.
+                    maybe_split(header, new_payload_size);
+                    grew_in_place = true;
+                }
+            }
         }
-        std::memcpy(new_ptr, ptr, old_payload_size); // old_payload_size < new_size here
-        my_free(ptr);
-        return new_ptr;
+    } // lock released here
+
+    if (grew_in_place) {
+        return ptr; // same pointer -- no data copy needed
     }
 
-    // General-path pointer -- Phase 3-5's existing realloc logic, unchanged.
-    const std::size_t new_payload_size = align_up(new_size);
-    BlockHeader* header = header_of(ptr);
-
-    // Same defensive check as my_free(): catch a ptr that's neither
-    // pooled nor a tracked general-path block instead of silently
-    // misinterpreting unrelated memory as a BlockHeader.
-    assert(arena_owning(header) != nullptr &&
-           "my_realloc() received a pointer that is neither a recognized pooled "
-           "allocation nor a tracked general-path arena block");
-
-    const std::size_t old_payload_size = header->get_size();
-
-    // realloc(ptr, 0): the C standard leaves this in
-    // implementation-defined/deprecated territory (freeing ptr and
-    // returning nullptr is one historical convention, but it's ambiguous
-    // -- a caller can't tell "freed successfully" apart from "the
-    // reallocation failed" from a nullptr return alone). We deliberately
-    // do NOT special-case it that way. my_malloc(0) already establishes
-    // this allocator's convention: it returns a valid, non-null pointer
-    // to a zero-payload block rather than treating size 0 as an error.
-    // Stay consistent with that here -- and conveniently, no special
-    // case is even needed: align_up(0) == 0, which always satisfies
-    // "new_payload_size <= old_payload_size" below (every existing
-    // block's size is >= 0), so my_realloc(ptr, 0) naturally falls
-    // through to "return ptr unchanged" on its own.
-    if (new_payload_size <= old_payload_size) {
-        // Already fits (a same-or-smaller request, including 0): no copy,
-        // no reallocation. This deliberately does not shrink-and-split
-        // the block down to new_payload_size -- it simply keeps the
-        // existing block as-is, trading a little internal fragmentation
-        // for avoiding an unnecessary copy on every shrink-realloc call.
-        return ptr;
-    }
-
-    // Growing. Try to grow in place first: if the right physical neighbor
-    // (within the same arena) exists, is free, and absorbing it would be
-    // large enough, merge it into this block instead of moving the data.
-    // Only the right neighbor is checked -- absorbing the left neighbor
-    // would move the payload's start address, which would defeat the
-    // "same pointer, no copy" point of growing in place at all.
-    if (BlockHeader* right = right_neighbor_if_free(header)) {
-        if (combined_payload_size(header, right) >= new_payload_size) {
-            absorb_right_neighbor(header, right);
-            // The combined block may now be larger than actually needed
-            // -- split the excess back into the free list rather than
-            // silently handing over the whole absorbed neighbor.
-            maybe_split(header, new_payload_size);
-            return ptr; // same pointer -- no data copy needed
-        }
-    }
-
-    // Grow-in-place isn't possible -- fall back to allocate + copy + free.
+    // Fallback: allocate + copy + free, both properly locked internally.
+    // Reached whenever growing a pooled pointer (always), or growing a
+    // general-path pointer that couldn't grow in place.
     void* new_ptr = my_malloc(new_size);
     if (new_ptr == nullptr) {
         // Standard realloc() contract: a failed reallocation must leave

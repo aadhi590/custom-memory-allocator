@@ -13,6 +13,9 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# Phase 7: std::mutex/std::thread require linking pthread on Linux.
+find_package(Threads REQUIRED)
+
 # ---------------------------------------------------------------------------
 # GoogleTest via FetchContent
 # ---------------------------------------------------------------------------
@@ -52,7 +55,7 @@ add_executable(allocator_tests
     src/memory_pool.cpp
 )
 target_include_directories(allocator_tests PRIVATE include)
-target_link_libraries(allocator_tests PRIVATE gtest_main)
+target_link_libraries(allocator_tests PRIVATE gtest_main Threads::Threads)
 
 include(GoogleTest)
 gtest_discover_tests(allocator_tests)
@@ -68,3 +71,4 @@ add_executable(basic_allocation
     src/memory_pool.cpp
 )
 target_include_directories(basic_allocation PRIVATE include)
+target_link_libraries(basic_allocation PRIVATE Threads::Threads)
