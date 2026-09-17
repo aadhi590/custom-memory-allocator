@@ -225,6 +225,20 @@ the pointer's address against each pool's tracked arena ranges.
   checks whether it equals the address of one of the 9 statically-known
   `Pool` objects.
 
+**Confirmed exact-equality check, not a range check**: `is_known_pool()`
+(`src/allocator.cpp`) does `&pool == candidate` for each of the 9 `Pool`
+objects in the fixed-size `pools()` array -- pointer *equality* against a
+small, enumerable set of specific addresses, never an inequality/range
+comparison (`>=`/`<`) against any address span. This distinction matters:
+a range check only needs a value to fall *somewhere* between two bounds,
+which a coincidentally-large general-path size could conceivably do if
+this allocator ever handled multi-gigabyte allocations sized to land
+inside that range. An exact-equality check against a handful of specific
+addresses has no such weakness -- a general-path size would have to
+numerically equal one particular static address bit-for-bit, not merely
+fall within a span, which is the basis for the "no false positives, by
+construction" claim below.
+
 **Reasoning**:
 
 - **O(kNumSizeClasses), not O(arenas or allocations).** `kNumSizeClasses`
