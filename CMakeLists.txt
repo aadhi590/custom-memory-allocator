@@ -37,8 +37,8 @@ enable_testing()
 # Only compiles test sources with real content (Phase 1: block layout;
 # Phase 2: os_memory and the bump allocator; Phase 3: the free list;
 # Phase 4: splitting/coalescing; Phase 5: calloc/realloc; Phase 6: memory
-# pools/size classes). Empty stub test files are added to this target as
-# their phases land.
+# pools/size classes; Phase 7: concurrency). Empty stub test files are
+# added to this target as their phases land.
 # ---------------------------------------------------------------------------
 add_executable(allocator_tests
     tests/test_block_layout.cpp
@@ -49,6 +49,7 @@ add_executable(allocator_tests
     tests/test_coalescing.cpp
     tests/test_realloc.cpp
     tests/test_memory_pool.cpp
+    tests/test_thread_safety.cpp
     src/os_memory.cpp
     src/allocator.cpp
     src/free_list.cpp
