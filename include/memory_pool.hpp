@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <mutex>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,22 @@ public:
     // created, mirroring arena_count_for_testing() for the general path.
     [[nodiscard]] std::size_t arena_count_for_testing() const noexcept { return arenas_.size(); }
 
+    // Phase 7, Stage 2+: this pool's own mutex, protecting its free-slot
+    // list and arena list from concurrent access. Deliberately NOT used
+    // internally by allocate()/deallocate()/expand() themselves -- Pool
+    // stays an unlocked, single-threaded-safe-only-by-convention data
+    // structure (consistent with block.hpp/free_list.hpp, which are also
+    // not internally locked), and it is entirely the allocator layer's
+    // (src/allocator.cpp's) responsibility to hold this mutex before
+    // calling into a Pool when the active concurrency stage requires it.
+    // This keeps Pool's own logic (and its existing single-threaded unit
+    // tests in test_memory_pool.cpp, which construct bare Pool objects
+    // directly) completely unaffected by which concurrency stage is
+    // compiled in. Public (not private-with-friend) because allocator.cpp
+    // needs to lock it directly, the same way it already reaches into
+    // Pool's other public members.
+    [[nodiscard]] std::mutex& mutex() noexcept { return mutex_; }
+
 private:
     struct Arena {
         void* base;
@@ -111,6 +128,7 @@ private:
     std::size_t slot_total_size_; // sizeof(PoolSlotHeader) + slot_payload_size_
     PoolSlotHeader* free_head_ = nullptr;
     std::vector<Arena> arenas_;
+    std::mutex mutex_;
 };
 
 // Size classes this allocator routes small allocations to, in ascending

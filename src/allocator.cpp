@@ -15,27 +15,61 @@
 #include "memory_pool.hpp"
 #include "os_memory.hpp"
 
+// ---------------------------------------------------------------------------
+// Concurrency staging (Phase 7, Part A)
+//
+// ALLOCATOR_CONCURRENCY_STAGE selects which locking strategy this
+// translation unit compiles: 1 (single global mutex), 2 (per-size-class
+// locks), or 3 (thread-local caching on top of Stage 2's locks). Chosen as
+// a COMPILE-TIME switch (a preprocessor define, defaulting to the most
+// complete stage implemented so far -- currently 2, until Stage 3 lands
+// in the next commit and becomes the default -- for ordinary builds like
+// allocator_tests and basic_allocation) rather than a runtime flag: each
+// stage compiles down
+// to a genuinely different code path with no runtime branching overhead
+// once selected, and Part B's benchmarks need to compare stage N against
+// stage N+1 as SEPARATE built executables (CMakeLists.txt builds one
+// benchmark_allocator_stageN target per stage, each passing
+// -DALLOCATOR_CONCURRENCY_STAGE=N), which a runtime flag would only
+// complicate without adding any real flexibility this project needs.
+// Every stage's locking machinery (mutexes, thread-local caches) is
+// unconditionally declared regardless of which stage is active -- only
+// USAGE is gated by `if constexpr (kConcurrencyStage == N)` -- both
+// because C++ requires all branches of an `if constexpr` in a non-template
+// function to be well-formed regardless of which one executes, and
+// because it keeps the three stages' code living side by side for easy
+// comparison rather than #ifdef'd in and out of existence.
+// ---------------------------------------------------------------------------
+#ifndef ALLOCATOR_CONCURRENCY_STAGE
+#define ALLOCATOR_CONCURRENCY_STAGE 2
+#endif
+
 namespace allocator {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Concurrency: Stage 1 -- single global mutex.
-//
-// The simplest possible correct concurrent version, and the baseline every
-// later concurrency stage is compared against in Part B's benchmarks: ONE
-// mutex covers ALL allocator state (every pool plus the general free-list/
-// arena path). Every public entry point (my_malloc/my_free; my_calloc and
-// my_realloc get correctness by calling the now-locked my_malloc()/
-// my_free() rather than touching shared state directly, except for
-// my_realloc's grow-in-place path, which takes this same mutex directly
-// for the short span where it manipulates the free list itself) acquires
-// this one lock for its entire body. No two allocator operations can ever
-// run concurrently under this stage, regardless of which pool or path
-// they'd otherwise touch -- correctness is trivial to see by inspection,
-// at the cost of zero parallelism.
-// ---------------------------------------------------------------------------
+constexpr int kConcurrencyStage = ALLOCATOR_CONCURRENCY_STAGE;
+static_assert(kConcurrencyStage >= 1 && kConcurrencyStage <= 3,
+              "ALLOCATOR_CONCURRENCY_STAGE must be 1, 2, or 3");
+
+// Stage 1's single mutex, covering ALL allocator state (every pool plus
+// the general free-list/arena path). Only actually locked when
+// kConcurrencyStage == 1; see pool_lock()/general_path_lock() below for
+// how stage selection maps onto which mutex each operation acquires.
 std::mutex& g_global_mutex() noexcept {
+    static std::mutex instance;
+    return instance;
+}
+
+// Stage 2+'s dedicated mutex for the general free-list/arena path (>4096
+// byte allocations). Pooled allocations use each Pool's own mutex()
+// instead (see memory_pool.hpp) -- threads allocating from different size
+// classes, or from a pool versus the general path, no longer contend with
+// each other under Stage 2, only threads using the exact same path/pool
+// do. Stage 3 keeps using this same mutex for the general path unchanged;
+// see docs/design-decisions.md for why the general path deliberately does
+// NOT get thread-local caching.
+std::mutex& general_mutex() noexcept {
     static std::mutex instance;
     return instance;
 }
@@ -125,17 +159,22 @@ std::array<Pool, kNumSizeClasses>& pools() noexcept {
     return instance;
 }
 
-// Finds the pool for an already-computed size class (as returned by
-// size_class_for()). O(kNumSizeClasses) -- a fixed, compile-time-constant
-// scan, not a function of how many arenas or allocations exist.
-Pool* pool_for_size_class(std::size_t size_class) noexcept {
+// Finds the index into pools()/kSizeClasses for an already-computed size
+// class (as returned by size_class_for()). O(kNumSizeClasses) -- a fixed,
+// compile-time-constant scan, not a function of how many arenas or
+// allocations exist. Needed as a standalone index (not just a Pool*) so
+// Stage 3's thread-local caches, indexed 0..kNumSizeClasses-1, can be
+// looked up alongside the pool itself.
+std::size_t pool_index_for_size_class(std::size_t size_class) noexcept {
     for (std::size_t i = 0; i < kNumSizeClasses; ++i) {
         if (kSizeClasses[i] == size_class) {
-            return &pools()[i];
+            return i;
         }
     }
-    return nullptr; // unreachable given a size_class that came from size_class_for()
+    return kNumSizeClasses; // unreachable given a size_class that came from size_class_for()
 }
+
+Pool* pool_for_size_class(std::size_t size_class) noexcept { return &pools()[pool_index_for_size_class(size_class)]; }
 
 // Returns true if `candidate` is the address of one of this allocator's
 // own, statically-known Pool objects. See the pointer-to-pool routing
@@ -151,6 +190,31 @@ bool is_known_pool(const Pool* candidate) noexcept {
         }
     }
     return false;
+}
+
+// Returns the mutex protecting `pool` under the currently-compiled
+// concurrency stage: Stage 1's single global mutex (since under Stage 1
+// nothing has its own lock -- everything shares one), or the pool's own
+// dedicated mutex under Stage 2/3. `if constexpr` on a compile-time
+// constant means this collapses to a single, fixed mutex reference at
+// compile time -- no runtime branch.
+std::mutex& pool_lock(Pool& pool) noexcept {
+    if constexpr (kConcurrencyStage == 1) {
+        return g_global_mutex();
+    } else {
+        return pool.mutex();
+    }
+}
+
+// Returns the mutex protecting the general free-list/arena path under the
+// currently-compiled concurrency stage: Stage 1's single global mutex, or
+// the dedicated general_mutex() under Stage 2/3.
+std::mutex& general_path_lock() noexcept {
+    if constexpr (kConcurrencyStage == 1) {
+        return g_global_mutex();
+    } else {
+        return general_mutex();
+    }
 }
 
 // Returns the arena that has room for `needed` more bytes, requesting a
@@ -350,16 +414,21 @@ void maybe_split(BlockHeader* header, std::size_t payload_size) noexcept {
 } // namespace
 
 void* my_malloc(std::size_t size) noexcept {
-    std::lock_guard<std::mutex> guard(g_global_mutex());
-
     // Small, common sizes route to a fixed-size pool: O(1) allocation,
     // zero search, zero splitting. Anything too large for any size class
     // falls through to the general free-list/arena path below, completely
-    // unchanged from Phase 5.
+    // unchanged from Phase 5. Locking granularity is stage-dependent:
+    // pool_lock()/general_path_lock() resolve to Stage 1's single global
+    // mutex, or Stage 2's dedicated per-pool/per-path mutex -- see the
+    // "Concurrency staging" comment near the top of this file.
     const std::size_t size_class = size_class_for(size);
     if (size_class != kNoSizeClass) {
-        return pool_for_size_class(size_class)->allocate();
+        Pool& pool = *pool_for_size_class(size_class);
+        std::lock_guard<std::mutex> guard(pool_lock(pool));
+        return pool.allocate();
     }
+
+    std::lock_guard<std::mutex> guard(general_path_lock());
 
     const std::size_t payload_size = align_up(size);
 
@@ -443,8 +512,6 @@ void my_free(void* ptr) noexcept {
         return;
     }
 
-    std::lock_guard<std::mutex> guard(g_global_mutex());
-
     // First, check whether ptr came from a pool. Pooled slots always
     // store their owning Pool* directly in the header immediately before
     // the payload (see memory_pool.hpp's PoolSlotHeader) -- read it
@@ -455,14 +522,27 @@ void my_free(void* ptr) noexcept {
     // GiB in realistic use), which can never numerically equal one of the
     // few known Pool object addresses (those live in the program's
     // static-storage-duration data, nowhere near small integer sizes).
+    //
+    // This read itself needs no lock: owning_pool is written once, by the
+    // thread that originally allocated this slot, before ptr was ever
+    // handed back to a caller, and is never mutated again until the slot
+    // is freed -- by the API contract, no other thread may concurrently
+    // free (or realloc) this exact ptr while this thread is also freeing
+    // it, so nothing else can be racing this read.
     auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
     if (is_known_pool(pool_header->owning_pool)) {
-        pool_header->owning_pool->deallocate(ptr);
+        Pool& pool = *pool_header->owning_pool;
+        std::lock_guard<std::mutex> guard(pool_lock(pool));
+        pool.deallocate(ptr);
         return;
     }
 
     // Not pooled -- general-path block. Everything below is Phase 3-5's
-    // existing coalescing logic, unchanged.
+    // existing coalescing logic, unchanged, now under the general path's
+    // lock (see pool_lock()'s comment for the same stage-dependent mutex
+    // reasoning).
+    std::lock_guard<std::mutex> guard(general_path_lock());
+
     BlockHeader* header = header_of(ptr);
 
     // Defensive check: if `ptr` is neither a recognized pooled allocation
@@ -523,98 +603,114 @@ void* my_realloc(void* ptr, std::size_t new_size) noexcept {
         return my_malloc(new_size); // locks internally
     }
 
-    // Determine whether `ptr` is pooled or general-path, and whether the
-    // request can be satisfied without moving the data, all under one
-    // lock scope -- released before falling through to my_malloc()/
-    // my_free() below (which each acquire this same mutex themselves;
-    // holding it across those calls would deadlock on this non-reentrant
-    // mutex). See the pointer-to-pool routing reasoning in my_free()
-    // above for what the speculative tag read means.
+    // Determine whether `ptr` is pooled or general-path FIRST -- the two
+    // have fundamentally different realloc strategies. See the pointer-to-
+    // pool routing reasoning in my_free() above for what the speculative
+    // tag read means and why it needs no lock.
     auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
-    std::size_t old_payload_size = 0;
+    if (is_known_pool(pool_header->owning_pool)) {
+        // slot_payload_size() reads an immutable (write-once-at-
+        // construction, never mutated again) value -- safe to read
+        // without any lock, regardless of concurrency stage. This whole
+        // branch never mutates shared allocator state directly: it
+        // either returns ptr unchanged, or falls through to my_malloc()/
+        // my_free() below, which lock internally -- so it needs no lock
+        // of its own at all.
+        const std::size_t old_payload_size = pool_header->owning_pool->slot_payload_size();
+
+        if (new_size <= old_payload_size) {
+            // Already fits within this fixed-size slot -- same pointer,
+            // no copy. Mirrors the general path's shrink-in-place
+            // behavior below, including realloc(ptr, 0)'s "return
+            // unchanged" convention (0 <= old_payload_size always holds).
+            return ptr;
+        }
+
+        // Pool slots are fixed-size with no adjacent free-space concept
+        // the way general-path blocks have -- no header/footer boundary
+        // tags, no physical-neighbor coalescing, since every slot in a
+        // pool is interchangeable rather than physically meaningful to
+        // merge with. Growing a pooled allocation is therefore ALWAYS a
+        // copy to a new allocation, never an in-place grow, regardless of
+        // how close new_size is to the next size class up or to the
+        // general path's threshold. This is a deliberate, documented
+        // behavior difference from general-path realloc() -- see
+        // docs/design-decisions.md.
+        void* new_ptr = my_malloc(new_size);
+        if (new_ptr == nullptr) {
+            return nullptr; // original pooled block left untouched
+        }
+        std::memcpy(new_ptr, ptr, old_payload_size); // old_payload_size < new_size here
+        my_free(ptr);
+        return new_ptr;
+    }
+
+    // General-path pointer -- Phase 3-5's existing realloc logic,
+    // unchanged, except now scoped under the general path's lock (see
+    // pool_lock()'s comment for the stage-dependent mutex reasoning) for
+    // the part that directly reads/mutates the free list and neighbor
+    // blocks. Released before falling through to my_malloc()/my_free()
+    // for the copy-fallback path, which each acquire this same mutex
+    // themselves -- holding it across those calls would deadlock on this
+    // non-reentrant mutex.
+    BlockHeader* header = header_of(ptr);
+
+    // Defensive check: catch a ptr that's neither pooled nor a tracked
+    // general-path block instead of silently misinterpreting unrelated
+    // memory as a BlockHeader. arena_owning() reads shared state, so this
+    // (like the rest of this branch) happens under the lock below.
+    std::size_t old_payload_size;
     bool grew_in_place = false;
     {
-        std::lock_guard<std::mutex> guard(g_global_mutex());
+        std::lock_guard<std::mutex> guard(general_path_lock());
 
-        if (is_known_pool(pool_header->owning_pool)) {
-            old_payload_size = pool_header->owning_pool->slot_payload_size();
+        assert(arena_owning(header) != nullptr &&
+               "my_realloc() received a pointer that is neither a recognized pooled "
+               "allocation nor a tracked general-path arena block");
 
-            if (new_size <= old_payload_size) {
-                // Already fits within this fixed-size slot -- same
-                // pointer, no copy. Mirrors the general path's
-                // shrink-in-place behavior below, including
-                // realloc(ptr, 0)'s "return unchanged" convention
-                // (0 <= old_payload_size always holds).
-                return ptr;
-            }
+        old_payload_size = header->get_size();
 
-            // Pool slots are fixed-size with no adjacent free-space
-            // concept the way general-path blocks have -- no
-            // header/footer boundary tags, no physical-neighbor
-            // coalescing, since every slot in a pool is interchangeable
-            // rather than physically meaningful to merge with. Growing a
-            // pooled allocation is therefore ALWAYS a copy to a new
-            // allocation, never an in-place grow, regardless of how
-            // close new_size is to the next size class up or to the
-            // general path's threshold. This is a deliberate, documented
-            // behavior difference from general-path realloc() -- see
-            // docs/design-decisions.md. `grew_in_place` stays false, so
-            // control falls through to the copy path below.
-        } else {
-            BlockHeader* header = header_of(ptr);
+        // realloc(ptr, 0): the C standard leaves this in
+        // implementation-defined/deprecated territory (freeing ptr and
+        // returning nullptr is one historical convention, but it's
+        // ambiguous -- a caller can't tell "freed successfully" apart
+        // from "the reallocation failed" from a nullptr return alone).
+        // We deliberately do NOT special-case it that way. my_malloc(0)
+        // already establishes this allocator's convention: it returns a
+        // valid, non-null pointer to a zero-payload block rather than
+        // treating size 0 as an error. Stay consistent with that here --
+        // and conveniently, no special case is even needed: align_up(0)
+        // == 0, which always satisfies "new_payload_size <=
+        // old_payload_size" below (every existing block's size is >= 0),
+        // so my_realloc(ptr, 0) naturally falls through to "return ptr
+        // unchanged" on its own.
+        const std::size_t new_payload_size = align_up(new_size);
+        if (new_payload_size <= old_payload_size) {
+            // Already fits (a same-or-smaller request, including 0): no
+            // copy, no reallocation. This deliberately does not
+            // shrink-and-split the block down to new_payload_size -- it
+            // simply keeps the existing block as-is, trading a little
+            // internal fragmentation for avoiding an unnecessary copy on
+            // every shrink-realloc call.
+            return ptr; // lock released via RAII on the way out
+        }
 
-            // Defensive check: catch a ptr that's neither pooled nor a
-            // tracked general-path block instead of silently
-            // misinterpreting unrelated memory as a BlockHeader.
-            assert(arena_owning(header) != nullptr &&
-                   "my_realloc() received a pointer that is neither a recognized pooled "
-                   "allocation nor a tracked general-path arena block");
-
-            old_payload_size = header->get_size();
-
-            // realloc(ptr, 0): the C standard leaves this in
-            // implementation-defined/deprecated territory (freeing ptr
-            // and returning nullptr is one historical convention, but
-            // it's ambiguous -- a caller can't tell "freed successfully"
-            // apart from "the reallocation failed" from a nullptr return
-            // alone). We deliberately do NOT special-case it that way.
-            // my_malloc(0) already establishes this allocator's
-            // convention: it returns a valid, non-null pointer to a
-            // zero-payload block rather than treating size 0 as an
-            // error. Stay consistent with that here -- and conveniently,
-            // no special case is even needed: align_up(0) == 0, which
-            // always satisfies "new_payload_size <= old_payload_size"
-            // below (every existing block's size is >= 0), so
-            // my_realloc(ptr, 0) naturally falls through to "return ptr
-            // unchanged" on its own.
-            const std::size_t new_payload_size = align_up(new_size);
-            if (new_payload_size <= old_payload_size) {
-                // Already fits (a same-or-smaller request, including 0):
-                // no copy, no reallocation. This deliberately does not
-                // shrink-and-split the block down to new_payload_size --
-                // it simply keeps the existing block as-is, trading a
-                // little internal fragmentation for avoiding an
-                // unnecessary copy on every shrink-realloc call.
-                return ptr;
-            }
-
-            // Growing. Try to grow in place first: if the right physical
-            // neighbor (within the same arena) exists, is free, and
-            // absorbing it would be large enough, merge it into this
-            // block instead of moving the data. Only the right neighbor
-            // is checked -- absorbing the left neighbor would move the
-            // payload's start address, which would defeat the "same
-            // pointer, no copy" point of growing in place at all.
-            if (BlockHeader* right = right_neighbor_if_free(header)) {
-                if (combined_payload_size(header, right) >= new_payload_size) {
-                    absorb_right_neighbor(header, right);
-                    // The combined block may now be larger than actually
-                    // needed -- split the excess back into the free list
-                    // rather than silently handing over the whole
-                    // absorbed neighbor.
-                    maybe_split(header, new_payload_size);
-                    grew_in_place = true;
-                }
+        // Growing. Try to grow in place first: if the right physical
+        // neighbor (within the same arena) exists, is free, and
+        // absorbing it would be large enough, merge it into this block
+        // instead of moving the data. Only the right neighbor is checked
+        // -- absorbing the left neighbor would move the payload's start
+        // address, which would defeat the "same pointer, no copy" point
+        // of growing in place at all.
+        if (BlockHeader* right = right_neighbor_if_free(header)) {
+            if (combined_payload_size(header, right) >= new_payload_size) {
+                absorb_right_neighbor(header, right);
+                // The combined block may now be larger than actually
+                // needed -- split the excess back into the free list
+                // rather than silently handing over the whole absorbed
+                // neighbor.
+                maybe_split(header, new_payload_size);
+                grew_in_place = true;
             }
         }
     } // lock released here
@@ -623,9 +719,8 @@ void* my_realloc(void* ptr, std::size_t new_size) noexcept {
         return ptr; // same pointer -- no data copy needed
     }
 
-    // Fallback: allocate + copy + free, both properly locked internally.
-    // Reached whenever growing a pooled pointer (always), or growing a
-    // general-path pointer that couldn't grow in place.
+    // Grow-in-place isn't possible -- fall back to allocate + copy + free,
+    // both properly locked internally.
     void* new_ptr = my_malloc(new_size);
     if (new_ptr == nullptr) {
         // Standard realloc() contract: a failed reallocation must leave
