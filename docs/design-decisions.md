@@ -277,6 +277,127 @@ construction" claim below.
 
 ---
 
+## 6. Concurrency staging: a compile-time macro and `if constexpr`, not a runtime switch
+
+**Decision**: which locking strategy `src/allocator.cpp` uses (a single
+global mutex, per-pool locks, or thread-local caching) is selected by the
+preprocessor macro `ALLOCATOR_CONCURRENCY_STAGE` (1, 2, or 3; default 3),
+read into `constexpr int kConcurrencyStage`, and dispatched on via
+`if constexpr`. Three separate benchmark executables
+(`benchmark_allocator_stage1/2/3`) are built from the *same* source file
+by giving each its own `target_compile_definitions` in `CMakeLists.txt`,
+rather than one executable that picks its stage at runtime.
+
+**Alternatives considered**:
+- **Runtime switch** (an enum/int checked at the top of every hot-path
+  function, or via a virtual `LockingStrategy` interface): would allow a
+  single built binary to be reconfigured without recompiling, and would
+  make it easier to, say, change strategy mid-process. Rejected for this
+  project because (a) Part B's benchmarks need to compare genuinely
+  different compiled code paths, not one binary branching on a runtime
+  flag -- a runtime `if` would add a real branch-and-maybe-indirect-call
+  cost to *every* stage's hot path, including Stage 1's, which would then
+  be measuring "Stage 1 plus dispatch overhead" rather than Stage 1 alone;
+  and (b) this allocator's usage pattern (fixed at process startup, not
+  changed while running) never needs runtime reconfigurability.
+- **Compile-time macro + `if constexpr`** (chosen): `kConcurrencyStage` is
+  a `constexpr int`, so `if constexpr (kConcurrencyStage == 3) { ... }
+  else { ... }` compiles away the untaken branch entirely -- Stage 1's
+  binary contains zero thread-local-cache code, and vice versa. This is
+  exactly what Part B's throughput comparison needs: three binaries that
+  differ only in the specific mechanism being measured, with no shared
+  runtime dispatch overhead polluting any of them.
+
+**Note on well-formedness**: `if constexpr` still requires both branches to
+be valid C++ regardless of which one is compiled in for a *given* build
+(unlike `#ifdef`, which can contain code that doesn't even parse under the
+other configuration) -- so both the locked and thread-local-cache code
+paths had to be written as ordinary, always-parseable C++, with only the
+macro deciding which one a given executable actually contains after
+compilation. This is a stricter but safer form of compile-time
+configuration than raw preprocessor branching would have been.
+
+---
+
+## 7. Thread-local cache batch size and cap: 32 and 64
+
+**Decision**: `kThreadLocalCacheBatchSize = 32` (how many slots a
+Stage 3 cache refills from its pool at once, on a cache-empty `malloc`)
+and `kThreadLocalCacheCap = 2 * kThreadLocalCacheBatchSize = 64` (the
+count above which a cache flushes a batch back to its pool, on a
+cache-full `free`).
+
+**Reasoning**:
+- **Batch size trades off lock-amortization against wasted memory.** A
+  larger batch means fewer pool-mutex acquisitions per allocation (better
+  amortization -- this is the entire reason Stage 3's 1-thread throughput
+  in `docs/benchmarks.md` is nearly double Stage 1/2's), but also means
+  more slots sitting idle in one thread's cache, unavailable to any other
+  thread, after a burst of allocation followed by a burst of frees
+  elsewhere. 32 was chosen as a round, moderate number -- large enough to
+  amortize a `std::mutex` lock/unlock pair over enough operations that its
+  fixed cost per allocation becomes small, small enough that no single
+  thread can sequester more than a few KB-worth of slots per size class at
+  once for the pool sizes this project uses.
+- **The cap is set to exactly twice the batch size.** This is the simplest
+  value that guarantees the cap-triggered flush-back path is reachable at
+  all without immediately re-triggering a refill: after a flush, the cache
+  drops by one batch's worth, landing well below the cap again rather than
+  oscillating between "just flushed" and "immediately needs to flush
+  again" on the next single free.
+- **Both are ordinary named `constexpr` constants in `src/allocator.cpp`,
+  not tuned per-size-class.** Every size class uses the same batch size
+  and cap. A per-size-class tuning pass (e.g. smaller batches for larger
+  slot sizes, to bound worst-case idle memory in bytes rather than in slot
+  count) was considered and explicitly deferred as out of scope -- it
+  would require empirical tuning this project's benchmarking scope doesn't
+  cover, for a benefit that's speculative without that data.
+
+---
+
+## 8. Cross-thread free: always push to the freeing thread's own cache
+
+**Decision**: in Stage 3, `my_free()` on a pooled pointer always pushes
+the freed slot onto the *freeing* thread's thread-local cache -- never the
+allocating thread's cache, and never directly back to the shared `Pool` --
+regardless of which thread originally allocated that slot. The only
+exception is the cap: if the freeing thread's cache is already at
+`kThreadLocalCacheCap`, a batch is flushed back to the shared pool (under
+that pool's mutex) to make room, same as it would be for a same-thread
+free.
+
+**Alternatives considered**:
+- **Return cross-thread frees to the global pool directly** (i.e. detect
+  "this slot wasn't allocated by me" and skip the local cache entirely for
+  those frees): keeps each thread's cache purely a reflection of its own
+  allocation activity, at the cost of extra bookkeeping (the slot would
+  need to record which thread -- or at least "was it ever cached
+  elsewhere" -- to distinguish this case) and an extra lock acquisition on
+  every cross-thread free, defeating the point of the cache for exactly
+  the workload this project's tests explicitly exercise (a producer thread
+  allocating and a consumer thread freeing).
+- **Always push to the freeing thread's own cache** (chosen): no
+  bookkeeping beyond what every free already needs; a cross-thread free is
+  exactly as cheap as a same-thread one. The trade-off, documented
+  honestly rather than hidden: a thread whose job is mostly to free memory
+  other threads allocated (a dedicated "consumer"/cleanup thread, say) can
+  accumulate cached slots for pools it may rarely or never personally
+  allocate from again. This is bounded, not unbounded -- `kThreadLocalCacheCap`
+  (Design Decision 7) applies uniformly regardless of *why* a cache grew,
+  so the worst case is that consumer thread's cache sits at the cap
+  per size class until it exits (at which point, per the current design,
+  those cached slots are simply left for `allocator_shutdown()` to handle,
+  same as any other thread's leftover cache) -- not that memory is
+  permanently lost or that the cap is bypassed.
+- **Verified by a dedicated test**: `CrossThreadFreeProducerAllocatesConsumerFrees`
+  in `tests/test_thread_safety.cpp` specifically allocates on one thread,
+  hands pointers to a second thread via a queue, and frees them all on
+  that second thread, run clean under ThreadSanitizer -- this scenario is
+  exercised deliberately, not just handled incidentally by the general
+  mixed-workload test.
+
+---
+
 ## Known issues / deferred hardening
 
 Items identified during the Phase 1 → Phase 2 review of `block.hpp`. Items 1

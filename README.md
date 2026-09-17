@@ -3,8 +3,8 @@
 A general-purpose, from-scratch heap memory allocator written in C++17 for
 Linux (x86-64). It implements the core mechanics of a real allocator —
 mmap-backed memory pools, block splitting and coalescing, size-class free
-lists, and eventually per-thread caching — as a portfolio project targeting
-systems/embedded C++ roles.
+lists, and a locking progression from a single global mutex to per-thread
+caching — as a portfolio project targeting systems/embedded C++ roles.
 
 ## Motivation
 
@@ -19,28 +19,37 @@ tradeoffs rather than a black-box wrapper around `malloc`.
 
 ## Current status
 
-**Phase 0-6 complete** — block metadata, a real `mmap`-backed general
-allocator with free-list reuse, splitting/coalescing, `calloc`/`realloc`,
-and now a second, pooled allocation path for small, common sizes.
+**All 7 phases complete.** This is the finished state of the project:
+block metadata, a real `mmap`-backed general allocator with free-list
+reuse, splitting/coalescing, `calloc`/`realloc`, a pooled allocation path
+for small, common sizes, and thread safety with a measured concurrency
+progression from a single global lock to per-thread caching.
 
 `my_malloc`/`my_free` (`include/allocator.hpp`) route through two paths.
 Small, common sizes (<= 4096 bytes, rounded up to one of 9 fixed size
 classes) go to `include/memory_pool.hpp`'s `Pool`: O(1) allocation and
 deallocation with zero search, zero splitting, zero coalescing. Everything
-larger uses the general path, unchanged from Phase 5: `os_memory`'s
-`mmap`/`munmap` wrapper, a doubly-linked free list
-(`include/free_list.hpp`) searched first-fit, and `include/block.hpp`'s
-`BlockHeader`/`BlockFooter` boundary-tag pair, with splitting/coalescing
-and `calloc`/`realloc` all working exactly as in Phase 5. `my_free()`/
-`my_realloc()` identify which path a pointer came from via a validated
-pool-ownership tag (O(1) in the number of size classes, not the number of
-arenas) rather than an address-range search. See
-[docs/memory-model.md](docs/memory-model.md) for the full block-layout
-explanation plus worked examples of splitting and coalescing, and
-[docs/design-decisions.md](docs/design-decisions.md) for the reasoning
-behind specific choices, including the pointer-to-pool routing decision.
-Caller-requested alignment beyond the default and thread safety don't
-exist yet.
+larger uses the general path: `os_memory`'s `mmap`/`munmap` wrapper, a
+doubly-linked free list (`include/free_list.hpp`) searched first-fit, and
+`include/block.hpp`'s `BlockHeader`/`BlockFooter` boundary-tag pair, with
+splitting/coalescing and `calloc`/`realloc`. `my_free()`/`my_realloc()`
+identify which path a pointer came from via a validated pool-ownership tag
+(O(1) in the number of size classes, not the number of arenas) rather than
+an address-range search. See [docs/memory-model.md](docs/memory-model.md)
+for the full block-layout explanation plus worked examples of splitting
+and coalescing, and [docs/design-decisions.md](docs/design-decisions.md)
+for the reasoning behind specific choices, including the pointer-to-pool
+routing decision and Phase 7's concurrency design.
+
+Thread safety (`src/allocator.cpp`) is built as three separately
+selectable stages via a compile-time `ALLOCATOR_CONCURRENCY_STAGE` macro:
+a single global mutex (Stage 1), per-size-class locks plus one
+general-path lock (Stage 2), and per-thread caching on top of Stage 2's
+locking (Stage 3, the default). All three are exercised and compared in
+`benchmarks/benchmark_allocator.cpp` — see
+[Performance summary](#performance-summary) below. Caller-requested
+alignment beyond the default remains out of scope (see "Cut from the
+original 13-phase plan" below).
 
 ## Build instructions
 
@@ -85,27 +94,45 @@ tests -- and every test that existed before Phase 7 (129 of the 136) was
 left completely unmodified by adding concurrency support; only new tests
 were added.
 
+## Performance summary
+
+Full methodology, environment details, and honest discussion of surprising
+results are in [docs/benchmarks.md](docs/benchmarks.md). Headline numbers,
+measured on this machine (WSL2, Intel i5-7200U, 2 physical/4 logical
+cores):
+
+- **Single-threaded**: this allocator's `malloc` mean latency is ~1135ns
+  vs. glibc's ~1006ns on the same mixed-size workload (this allocator
+  trails glibc here — reported honestly, with the likely reasons, in
+  `docs/benchmarks.md`).
+- **Multithreaded throughput, 1 -> 8 threads** (the single most important
+  chart in the project): Stage 1 (global mutex) collapses from
+  30.1M to 4.4M ops/sec under contention, while Stage 2 (per-pool locks)
+  and Stage 3 (thread-local caching) hold up far better, and Stage 3 is
+  nearly 2x Stage 1/2's throughput at 1 thread (58.7M ops/sec) by
+  amortizing lock cost across a batch of 32 allocations.
+
 ## Repository layout
 
 ```
 include/     public headers (block.hpp, allocator.hpp, free_list.hpp, os_memory.hpp, memory_pool.hpp have real content)
 src/         implementation files (allocator.cpp, free_list.cpp, os_memory.cpp, memory_pool.cpp have real content)
 tests/       GoogleTest test suites
-benchmarks/  throughput/fragmentation benchmarks (Phase 9+)
+benchmarks/  throughput/latency and fragmentation-awareness benchmarks (Phase 7)
 examples/    example programs using the allocator (basic_allocation.cpp)
 docs/        architecture, memory model, design decisions, benchmark results
-scripts/     developer tooling (Phase 9+)
+scripts/     developer tooling (run_benchmarks.sh)
 ```
 
 ## Roadmap
 
 **The project plan was trimmed from an original 13 phases to 7, partway
 through, for time.** Phases 0-5 below are unchanged from the original plan.
-Phase 6 is this project's current phase. Phase 7 is a merged final phase
-covering what the original plan spread across separate concurrency,
-benchmarking, hardening, and polish phases. See the "Scope reduction:
-13 phases to 7" entry in [docs/design-decisions.md](docs/design-decisions.md)
-for the full rationale and exactly what was cut.
+Phase 7 is a merged final phase covering what the original plan spread
+across separate concurrency, benchmarking, hardening, and polish phases.
+See the "Scope reduction: 13 phases to 7" entry in
+[docs/design-decisions.md](docs/design-decisions.md) for the full
+rationale and exactly what was cut. **All 7 phases are now complete.**
 
 - [x] **Phase 0** — Project scaffolding: repo layout, CMake + GoogleTest
       build, licensing, tooling config.
@@ -124,9 +151,11 @@ for the full rationale and exactly what was cut.
       small, common allocation sizes as a second, O(1) allocation path
       alongside the general free-list allocator (which continues to handle
       everything above the largest size class).
-- [ ] **Phase 7** — Concurrency and performance benchmarking (merged final
-      phase): a locking progression for thread safety, thread-local caching
-      to reduce contention, and benchmarking the allocator's performance.
+- [x] **Phase 7** — Concurrency and performance benchmarking (merged final
+      phase): a locking progression for thread safety (global mutex ->
+      per-pool locks -> thread-local caching, all three kept selectable
+      and benchmarked), ThreadSanitizer-verified concurrency tests, and
+      real, honestly-reported throughput/latency/fragmentation benchmarks.
 
 ### Cut from the original 13-phase plan
 
