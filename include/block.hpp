@@ -268,7 +268,19 @@ private:
     // Size (with the is_free flag packed into bit 0). This is the only data
     // member: next/prev free-list pointers and the user payload both live in
     // the memory immediately following this struct, never inside it.
-    std::size_t size_and_flags_;
+    //
+    // Default-initialized to 0 (rather than left indeterminate) because
+    // the constructor's first call, set_size(size), reads the CURRENT
+    // flag bit out of size_and_flags_ before overwriting the size bits --
+    // by design, so a size update never disturbs the flag -- which means
+    // that read has to see a well-defined value even on a
+    // freshly-constructed object, or it's reading indeterminate memory
+    // (technically undefined behavior, and something GCC's -O2 correctly
+    // flags as -Wmaybe-uninitialized in Release builds even though the
+    // FINAL value after the constructor finishes is always deterministic
+    // regardless, since the very next call, set_free(), unconditionally
+    // overwrites the flag bit either way).
+    std::size_t size_and_flags_ = 0;
 };
 
 // The payload must start alignof(std::max_align_t)-aligned given an aligned

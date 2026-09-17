@@ -73,3 +73,28 @@ add_executable(basic_allocation
 )
 target_include_directories(basic_allocation PRIVATE include)
 target_link_libraries(basic_allocation PRIVATE Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# Benchmarks (Phase 7, Part B)
+#
+# benchmark_allocator is built once PER concurrency stage (see
+# src/allocator.cpp's "Concurrency staging" comment) -- three separate
+# executables from the exact same benchmark source, each linked against
+# allocator.cpp compiled with a different ALLOCATOR_CONCURRENCY_STAGE, so
+# Part B's throughput comparison is measuring genuinely different compiled
+# code, not one binary branching at runtime. Intended to be built in
+# Release mode (see scripts/run_benchmarks.sh) -- Debug's lack of
+# optimization would make the latency/throughput numbers meaningless.
+# ---------------------------------------------------------------------------
+foreach(STAGE 1 2 3)
+    add_executable(benchmark_allocator_stage${STAGE}
+        benchmarks/benchmark_allocator.cpp
+        src/os_memory.cpp
+        src/allocator.cpp
+        src/free_list.cpp
+        src/memory_pool.cpp
+    )
+    target_include_directories(benchmark_allocator_stage${STAGE} PRIVATE include)
+    target_link_libraries(benchmark_allocator_stage${STAGE} PRIVATE Threads::Threads)
+    target_compile_definitions(benchmark_allocator_stage${STAGE} PRIVATE ALLOCATOR_CONCURRENCY_STAGE=${STAGE})
+endforeach()
