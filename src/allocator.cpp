@@ -21,11 +21,9 @@
 // ALLOCATOR_CONCURRENCY_STAGE selects which locking strategy this
 // translation unit compiles: 1 (single global mutex), 2 (per-size-class
 // locks), or 3 (thread-local caching on top of Stage 2's locks). Chosen as
-// a COMPILE-TIME switch (a preprocessor define, defaulting to the most
-// complete stage implemented so far -- currently 2, until Stage 3 lands
-// in the next commit and becomes the default -- for ordinary builds like
-// allocator_tests and basic_allocation) rather than a runtime flag: each
-// stage compiles down
+// a COMPILE-TIME switch (a preprocessor define, defaulting to 3 -- the
+// most complete stage -- for ordinary builds like allocator_tests and
+// basic_allocation) rather than a runtime flag: each stage compiles down
 // to a genuinely different code path with no runtime branching overhead
 // once selected, and Part B's benchmarks need to compare stage N against
 // stage N+1 as SEPARATE built executables (CMakeLists.txt builds one
@@ -41,7 +39,7 @@
 // comparison rather than #ifdef'd in and out of existence.
 // ---------------------------------------------------------------------------
 #ifndef ALLOCATOR_CONCURRENCY_STAGE
-#define ALLOCATOR_CONCURRENCY_STAGE 2
+#define ALLOCATOR_CONCURRENCY_STAGE 3
 #endif
 
 namespace allocator {
@@ -73,6 +71,79 @@ std::mutex& general_mutex() noexcept {
     static std::mutex instance;
     return instance;
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency: Stage 3 -- thread-local caching.
+//
+// Layered ONLY on top of the pooled path's Stage 2 per-pool locks -- the
+// general free-list/arena path (>4096 bytes) is deliberately NOT given
+// thread-local caching (see docs/design-decisions.md): large allocations
+// are infrequent enough in typical workloads that the added complexity
+// (and the memory a per-thread general-path cache would tie up) isn't
+// worth it, so the general path keeps using general_path_lock() exactly
+// as under Stage 2.
+//
+// Each thread keeps a small private free-slot cache PER SIZE CLASS.
+// my_malloc() for a pooled size checks the calling thread's own cache
+// first -- no lock, no contention with any other thread -- and only
+// touches the pool's mutex when the cache is empty (refill) or has grown
+// past a cap (flush), amortizing the lock acquisition over a whole BATCH
+// of slots instead of paying for one lock/unlock per allocation. See
+// kThreadLocalCacheBatchSize/kThreadLocalCacheCap below for the exact
+// constants and the reasoning behind them.
+// ---------------------------------------------------------------------------
+
+// A thread's private free-slot cache for ONE size class: a singly-linked
+// chain (still in PoolSlotHeader "free" format) plus its tail (for O(1)
+// splicing during refill/flush) and count (to know when to flush without
+// walking the chain).
+//
+// Forced to alignas(64) (a typical x86-64 cache line size) so that
+// different THREADS' cache instances never land on the same cache line.
+// This matters because thread_local storage for statically-declared
+// variables (as opposed to dynamically loaded ones) is commonly allocated
+// by the runtime as one contiguous block per thread, and consecutive
+// threads' blocks can end up adjacent in memory depending on the
+// allocation strategy the runtime uses when creating each new thread --
+// without padding, one thread writing to its cache could invalidate the
+// cache line another thread's adjacent cache lives on (false sharing),
+// causing real cross-core cache-coherency traffic for data that isn't
+// actually shared at all. This is the same technique production
+// thread-caching allocators (e.g. tcmalloc's per-thread caches) use for
+// the same reason.
+struct alignas(64) ThreadLocalCache {
+    PoolSlotHeader* head = nullptr;
+    PoolSlotHeader* tail = nullptr;
+    std::size_t count = 0;
+};
+
+// Number of slots moved per lock acquisition when a thread's cache is
+// refilled from (or flushed back to) a pool. Chosen as a middle ground:
+// too small and the lock-acquisition cost (the whole point of caching)
+// isn't well amortized across the slots gained; too large and a single
+// refill both holds the pool's lock longer (increasing contention for
+// OTHER threads waiting on that same pool) and reserves more memory in
+// one thread's private cache that other threads can't reuse until it's
+// freed or flushed back -- wasteful for a thread that only allocates a
+// handful of objects before exiting. 32 is small enough to keep any one
+// refill/flush fast and any one thread's hoarded memory bounded, while
+// still amortizing the lock over far more than one slot at a time.
+constexpr std::size_t kThreadLocalCacheBatchSize = 32;
+
+// A thread's cache flushes a batch back to the global pool once its count
+// exceeds this. Set to 2x the batch size (64) so a thread whose
+// allocate/free pattern is roughly balanced -- or even free-heavy for a
+// while -- doesn't flush on every single free once it's near the
+// boundary: there's a full batch's worth of slack above the refill level
+// before a flush triggers, and the flush itself drains back down by one
+// batch, not to zero, avoiding a thrash of "flush one, immediately need
+// to refill one" if usage hovers right at the cap.
+constexpr std::size_t kThreadLocalCacheCap = 2 * kThreadLocalCacheBatchSize;
+
+// Per-thread, per-size-class caches. thread_local: each thread that
+// touches this gets its own independent copy; no synchronization needed
+// to read/write it, which is the entire point.
+thread_local std::array<ThreadLocalCache, kNumSizeClasses> tls_caches;
 
 // Default size of each OS-backed arena requested via os_acquire(). Chosen
 // as a middle ground: large enough to amortize the mmap syscall (and its
@@ -214,6 +285,111 @@ std::mutex& general_path_lock() noexcept {
         return g_global_mutex();
     } else {
         return general_mutex();
+    }
+}
+
+// The inverse of pool_index_for_size_class(): given a Pool* already
+// confirmed to be one of pools()'s own elements (via is_known_pool()),
+// recovers its index via pointer arithmetic within the array -- O(1), no
+// scan needed, since `pool` is guaranteed to point at some pools()[i].
+// Needed by Stage 3's my_free_pooled_stage3() to find the right
+// thread-local cache slot to push a freed pointer into.
+std::size_t pool_index_of(const Pool* pool) noexcept {
+    return static_cast<std::size_t>(pool - &pools()[0]);
+}
+
+// Pops the head off `cache` (which must be non-empty) and marks it
+// allocated by the pool at `index`, returning its payload pointer. Shared
+// by both the cache-hit fast path and the post-refill path in
+// my_malloc_pooled_stage3().
+void* pop_from_cache(ThreadLocalCache& cache, std::size_t index) noexcept {
+    PoolSlotHeader* slot = cache.head;
+    cache.head = slot->next_free;
+    if (cache.head == nullptr) {
+        cache.tail = nullptr;
+    }
+    --cache.count;
+
+    slot->owning_pool = &pools()[index];
+    return reinterpret_cast<std::byte*>(slot) + sizeof(PoolSlotHeader);
+}
+
+// Stage 3's my_malloc() path for a pooled size class: check the calling
+// thread's own cache first (no lock at all); only on a cache miss does
+// this touch the pool's mutex, once, to refill a whole batch.
+void* my_malloc_pooled_stage3(std::size_t index) noexcept {
+    ThreadLocalCache& cache = tls_caches[index];
+    if (cache.head != nullptr) {
+        return pop_from_cache(cache, index);
+    }
+
+    Pool& pool = pools()[index];
+    Pool::SlotBatch batch;
+    {
+        std::lock_guard<std::mutex> guard(pool.mutex());
+        batch = pool.allocate_batch(kThreadLocalCacheBatchSize);
+    }
+    if (batch.head == nullptr) {
+        return nullptr; // pool exhausted (OS memory request failed)
+    }
+
+    cache.head = batch.head;
+    cache.tail = batch.tail;
+    cache.count = batch.count;
+    return pop_from_cache(cache, index);
+}
+
+// Detaches up to kThreadLocalCacheBatchSize slots from `cache`'s head
+// (reusing the same constant as refill, for symmetry) and splices them
+// back onto `pool`'s free-slot list under one lock acquisition, leaving
+// any remainder in the cache rather than draining it completely -- so a
+// thread hovering right at the cap doesn't immediately need to refill
+// again on its very next allocation.
+void flush_batch_to_pool(ThreadLocalCache& cache, Pool& pool) noexcept {
+    PoolSlotHeader* detach_head = cache.head;
+    PoolSlotHeader* detach_tail = detach_head;
+    std::size_t detach_count = 1;
+    while (detach_count < kThreadLocalCacheBatchSize && detach_tail->next_free != nullptr) {
+        detach_tail = detach_tail->next_free;
+        ++detach_count;
+    }
+
+    cache.head = detach_tail->next_free;
+    detach_tail->next_free = nullptr;
+    if (cache.head == nullptr) {
+        cache.tail = nullptr;
+    }
+    cache.count -= detach_count;
+
+    std::lock_guard<std::mutex> guard(pool.mutex());
+    pool.deallocate_batch(detach_head, detach_tail);
+}
+
+// Stage 3's my_free() path for a pooled pointer. Documented simplification
+// (see docs/design-decisions.md for the full trade-off discussion):
+// freed slots ALWAYS go to the freeing thread's own cache, regardless of
+// which thread originally allocated them -- not back to the pool that
+// allocated them, and not to the originating thread's cache. This makes
+// cross-thread frees (thread A allocates, thread B frees) trivially
+// correct with no extra bookkeeping (a slot is just tagged by its
+// owning_pool, never by which thread touched it), at the cost that a
+// thread which mostly frees memory OTHER threads allocated can
+// accumulate cache entries for a pool it may never personally allocate
+// from again -- bounded by kThreadLocalCacheCap regardless, since the
+// cap triggers a flush back to the shared pool the same way it would for
+// any other cache growth.
+void my_free_pooled_stage3(PoolSlotHeader* slot, Pool& pool, std::size_t index) noexcept {
+    ThreadLocalCache& cache = tls_caches[index];
+
+    slot->next_free = cache.head;
+    if (cache.head == nullptr) {
+        cache.tail = slot;
+    }
+    cache.head = slot;
+    ++cache.count;
+
+    if (cache.count > kThreadLocalCacheCap) {
+        flush_batch_to_pool(cache, pool);
     }
 }
 
@@ -417,15 +593,20 @@ void* my_malloc(std::size_t size) noexcept {
     // Small, common sizes route to a fixed-size pool: O(1) allocation,
     // zero search, zero splitting. Anything too large for any size class
     // falls through to the general free-list/arena path below, completely
-    // unchanged from Phase 5. Locking granularity is stage-dependent:
-    // pool_lock()/general_path_lock() resolve to Stage 1's single global
-    // mutex, or Stage 2's dedicated per-pool/per-path mutex -- see the
+    // unchanged from Phase 5. Locking granularity is stage-dependent: under
+    // Stage 3, pooled sizes go through the thread-local cache (no lock on
+    // a cache hit); under Stage 1/2, pool_lock() resolves to Stage 1's
+    // single global mutex or Stage 2's dedicated per-pool mutex -- see the
     // "Concurrency staging" comment near the top of this file.
     const std::size_t size_class = size_class_for(size);
     if (size_class != kNoSizeClass) {
-        Pool& pool = *pool_for_size_class(size_class);
-        std::lock_guard<std::mutex> guard(pool_lock(pool));
-        return pool.allocate();
+        if constexpr (kConcurrencyStage == 3) {
+            return my_malloc_pooled_stage3(pool_index_for_size_class(size_class));
+        } else {
+            Pool& pool = *pool_for_size_class(size_class);
+            std::lock_guard<std::mutex> guard(pool_lock(pool));
+            return pool.allocate();
+        }
     }
 
     std::lock_guard<std::mutex> guard(general_path_lock());
@@ -532,8 +713,18 @@ void my_free(void* ptr) noexcept {
     auto* pool_header = reinterpret_cast<PoolSlotHeader*>(static_cast<std::byte*>(ptr) - sizeof(PoolSlotHeader));
     if (is_known_pool(pool_header->owning_pool)) {
         Pool& pool = *pool_header->owning_pool;
-        std::lock_guard<std::mutex> guard(pool_lock(pool));
-        pool.deallocate(ptr);
+        if constexpr (kConcurrencyStage == 3) {
+            // Documented simplification: always pushes to the FREEING
+            // thread's own cache, regardless of which thread originally
+            // allocated this slot -- see
+            // my_free_pooled_stage3()'s comment and
+            // docs/design-decisions.md for the cross-thread-free
+            // trade-off this represents.
+            my_free_pooled_stage3(pool_header, pool, pool_index_of(&pool));
+        } else {
+            std::lock_guard<std::mutex> guard(pool_lock(pool));
+            pool.deallocate(ptr);
+        }
         return;
     }
 
@@ -756,6 +947,20 @@ void allocator_shutdown() noexcept {
     // across both allocation paths, not just the general one.
     for (Pool& pool : pools()) {
         pool.release_all_arenas();
+    }
+
+    // The CALLING thread's own thread-local caches (Stage 3) may hold
+    // slots pointing into the arenas just released above -- reset them to
+    // avoid leaving dangling pointers a later my_malloc() call on this
+    // same thread could hand back. This only clears the calling thread's
+    // own cache (thread_local storage is inherently per-thread); a real
+    // caller is expected to call allocator_shutdown() only after every
+    // other thread that used this allocator has already joined and freed
+    // everything it allocated -- exactly how this project's own tests and
+    // benchmarks use it. Harmless (already empty) under Stage 1/2, where
+    // these caches are never populated in the first place.
+    for (ThreadLocalCache& cache : tls_caches) {
+        cache = ThreadLocalCache{};
     }
 }
 

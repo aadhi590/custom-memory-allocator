@@ -84,6 +84,35 @@ public:
     // determined `ptr` really belongs to this pool.
     void deallocate(void* ptr) noexcept;
 
+    // A chain of free slots still linked via PoolSlotHeader::next_free
+    // (i.e. still in "free" format -- none of them have owning_pool set),
+    // for a caller to claim individually later. Returned by
+    // allocate_batch() and consumed by deallocate_batch().
+    struct SlotBatch {
+        PoolSlotHeader* head = nullptr;
+        PoolSlotHeader* tail = nullptr;
+        std::size_t count = 0;
+    };
+
+    // Phase 7, Stage 3: pops up to `max_count` slots from the free-slot
+    // list as a single linked chain, expanding (requesting a new arena)
+    // if needed, same as allocate(). Unlike allocate(), the returned
+    // slots are left in "free" format (next_free chain), not marked
+    // allocated -- the caller (the thread-local cache layer in
+    // allocator.cpp) claims them one at a time later, setting
+    // owning_pool only on the specific slot it hands out. May return
+    // fewer than max_count (down to 0) if the OS memory request needed to
+    // satisfy the full batch fails partway through -- callers must be
+    // prepared for a partial or empty batch.
+    [[nodiscard]] SlotBatch allocate_batch(std::size_t max_count) noexcept;
+
+    // Splices an entire chain of free slots (as obtained from
+    // allocate_batch(), or assembled by the caller) back onto the
+    // free-slot list in O(1) -- a single pointer write, not one push per
+    // slot -- minimizing how long a caller needs to hold this pool's
+    // mutex while flushing a thread-local cache back to the pool.
+    void deallocate_batch(PoolSlotHeader* chain_head, PoolSlotHeader* chain_tail) noexcept;
+
     [[nodiscard]] std::size_t slot_payload_size() const noexcept { return slot_payload_size_; }
 
     // Releases every arena this pool has acquired back to the OS and

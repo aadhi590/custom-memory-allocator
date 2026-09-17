@@ -189,6 +189,102 @@ TEST(PoolTest, ExhaustingInitialArenaTriggersExpansionAndContinuesWorking) {
 }
 
 // ---------------------------------------------------------------------------
+// Pool::allocate_batch() / deallocate_batch() (Phase 7, Stage 3 support)
+// ---------------------------------------------------------------------------
+
+TEST(PoolTest, AllocateBatchReturnsRequestedCountAsAValidChain) {
+    allocator::Pool pool(64);
+
+    auto batch = pool.allocate_batch(10);
+    EXPECT_EQ(batch.count, 10u);
+    ASSERT_NE(batch.head, nullptr);
+    ASSERT_NE(batch.tail, nullptr);
+
+    // Walk the chain and confirm it really has exactly `count` nodes,
+    // ending at `tail`, with next_free (not owning_pool) still valid --
+    // i.e. still in "free" format, not marked allocated.
+    allocator::PoolSlotHeader* node = batch.head;
+    std::size_t walked = 1;
+    while (node->next_free != nullptr) {
+        node = node->next_free;
+        ++walked;
+    }
+    EXPECT_EQ(walked, batch.count);
+    EXPECT_EQ(node, batch.tail);
+
+    pool.release_all_arenas();
+}
+
+TEST(PoolTest, AllocateBatchSlotsAreIndividuallyUsableAfterClaiming) {
+    allocator::Pool pool(32);
+
+    auto batch = pool.allocate_batch(5);
+    ASSERT_EQ(batch.count, 5u);
+
+    // Claim each slot individually (mirroring how allocator.cpp's
+    // thread-local cache layer hands one out at a time), write through
+    // it, and verify no overlap.
+    std::vector<void*> ptrs;
+    allocator::PoolSlotHeader* node = batch.head;
+    for (std::size_t i = 0; i < batch.count; ++i) {
+        allocator::PoolSlotHeader* next = node->next_free;
+        void* payload = reinterpret_cast<std::byte*>(node) + sizeof(allocator::PoolSlotHeader);
+        std::memset(payload, static_cast<unsigned char>(i), 32);
+        ptrs.push_back(payload);
+        node = next;
+    }
+
+    for (std::size_t i = 0; i < ptrs.size(); ++i) {
+        const auto* bytes = static_cast<const unsigned char*>(ptrs[i]);
+        for (std::size_t b = 0; b < 32; ++b) {
+            ASSERT_EQ(bytes[b], static_cast<unsigned char>(i)) << "slot " << i << " byte " << b;
+        }
+    }
+
+    pool.release_all_arenas();
+}
+
+TEST(PoolTest, DeallocateBatchSpliceMakesSlotsReusableViaAllocate) {
+    allocator::Pool pool(16);
+
+    auto batch = pool.allocate_batch(8);
+    ASSERT_EQ(batch.count, 8u);
+
+    // Return the whole batch at once via the O(1) splice.
+    pool.deallocate_batch(batch.head, batch.tail);
+
+    // All 8 slots must now be reachable again through ordinary
+    // allocate() calls.
+    std::vector<void*> ptrs;
+    for (int i = 0; i < 8; ++i) {
+        void* ptr = pool.allocate();
+        ASSERT_NE(ptr, nullptr);
+        ptrs.push_back(ptr);
+    }
+    // No duplicates -- confirms the spliced chain wasn't corrupted (e.g.
+    // a cycle, or a lost node) by the batch round trip.
+    for (std::size_t i = 0; i < ptrs.size(); ++i) {
+        for (std::size_t j = i + 1; j < ptrs.size(); ++j) {
+            EXPECT_NE(ptrs[i], ptrs[j]) << "duplicate slot at " << i << " and " << j;
+        }
+    }
+
+    pool.release_all_arenas();
+}
+
+TEST(PoolTest, AllocateBatchExpandsAcrossArenaBoundaryWhenNeeded) {
+    allocator::Pool pool(16); // one arena holds ~256 slots
+
+    // Request more slots than a single arena holds, forcing expand()
+    // partway through the batch.
+    auto batch = pool.allocate_batch(600);
+    EXPECT_EQ(batch.count, 600u);
+    EXPECT_GE(pool.arena_count_for_testing(), 2u);
+
+    pool.release_all_arenas();
+}
+
+// ---------------------------------------------------------------------------
 // Pointer-to-pool routing (through the public allocator API)
 //
 // These exercise allocator.cpp's my_malloc()/my_free() routing directly,

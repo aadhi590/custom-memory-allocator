@@ -79,6 +79,35 @@ void Pool::deallocate(void* ptr) noexcept {
     free_head_ = slot;
 }
 
+Pool::SlotBatch Pool::allocate_batch(std::size_t max_count) noexcept {
+    SlotBatch batch;
+
+    while (batch.count < max_count) {
+        if (free_head_ == nullptr && !expand()) {
+            break; // OS memory exhausted -- return whatever was gathered so far
+        }
+
+        PoolSlotHeader* slot = free_head_;
+        free_head_ = slot->next_free;
+
+        slot->next_free = nullptr;
+        if (batch.tail == nullptr) {
+            batch.head = slot;
+        } else {
+            batch.tail->next_free = slot;
+        }
+        batch.tail = slot;
+        ++batch.count;
+    }
+
+    return batch;
+}
+
+void Pool::deallocate_batch(PoolSlotHeader* chain_head, PoolSlotHeader* chain_tail) noexcept {
+    chain_tail->next_free = free_head_;
+    free_head_ = chain_head;
+}
+
 void Pool::release_all_arenas() noexcept {
     for (const Arena& arena : arenas_) {
         [[maybe_unused]] const bool released = os_release(arena.base, arena.size);
